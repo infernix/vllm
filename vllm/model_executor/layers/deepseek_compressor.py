@@ -460,8 +460,6 @@ class DeepseekCompressor(nn.Module):
         positions: torch.Tensor,
         rotary_emb,
     ) -> torch.Tensor | None:
-        if current_platform.is_device_capability_family(120):
-            return self._forward_sm120_torch(kv_score, positions, rotary_emb)
 
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
