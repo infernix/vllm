@@ -24,7 +24,7 @@ exec env -u PYTORCH_CUDA_ALLOC_CONF \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --max-model-len 131072 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.98 \
   --tensor-parallel-size 2 \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 \
