@@ -1,0 +1,4 @@
+[submodule "DeepGEMM"]
+	path = DeepGEMM
+	url = https://github.com/leavelet/DeepGEMM.git
+	branch = sm120
