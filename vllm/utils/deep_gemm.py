@@ -591,16 +591,26 @@ def _flatten_b12x_index_k_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, i
     if kv_cache.dtype != torch.uint8:
         raise TypeError(f"Expected uint8 kv_cache for b12x, got {kv_cache.dtype}")
     if kv_cache.dim() == 3:
-        _, block_size, head_dim_with_scale = kv_cache.shape
+        num_blocks, block_size, head_dim_with_scale = kv_cache.shape
+        kv_pages = kv_cache.contiguous()
     elif kv_cache.dim() == 4:
-        _, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
+        num_blocks, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
         if num_kv_heads != 1:
             raise ValueError(f"Expected one KV head, got {num_kv_heads}")
+        kv_pages = kv_cache.contiguous().squeeze(2)
     else:
         raise ValueError(
             f"Expected 3D or 4D kv_cache for b12x, got {kv_cache.dim()} dimensions"
         )
-    return kv_cache.contiguous().view(kv_cache.shape[0], block_size * head_dim_with_scale), block_size
+    if block_size > 64 and block_size % 64 == 0:
+        page_size = 64
+        page_factor = block_size // page_size
+        kv_pages = kv_pages.reshape(
+            num_blocks, page_factor, page_size, head_dim_with_scale
+        ).reshape(num_blocks * page_factor, page_size, head_dim_with_scale)
+    else:
+        page_size = block_size
+    return kv_pages.reshape(kv_pages.shape[0], page_size * head_dim_with_scale), page_size
 
 
 def _fp8_mqa_logits_b12x(
@@ -652,9 +662,31 @@ def _fp8_paged_mqa_logits_b12x(
     q_rows = batch_size * next_n
     q_fp8 = q_values.reshape(q_rows, num_heads, head_dim)
     seqlens = context_lens.reshape(q_rows).contiguous()
-    page_table = block_tables[:, None, :].expand(batch_size, next_n, block_tables.shape[1])
+    original_block_size = kv_cache.shape[1]
+    page_factor = max(1, original_block_size // page_size)
+    needed_block_cols = max(
+        1, (int(seqlens.max().item()) + original_block_size - 1) // original_block_size
+    )
+    trimmed_block_tables = block_tables[:, :needed_block_cols].contiguous().to(torch.int32)
+    if page_factor > 1:
+        page_offsets = torch.arange(
+            page_factor, device=trimmed_block_tables.device, dtype=torch.int32
+        )
+        expanded_pages = trimmed_block_tables.unsqueeze(-1) * page_factor + page_offsets
+        expanded_pages = torch.where(
+            trimmed_block_tables.unsqueeze(-1) >= 0,
+            expanded_pages,
+            torch.full_like(expanded_pages, -1),
+        )
+        page_table_blocks = expanded_pages.reshape(batch_size, needed_block_cols * page_factor)
+    else:
+        page_table_blocks = trimmed_block_tables
+    max_pages = max(1, (int(seqlens.max().item()) + page_size - 1) // page_size)
+    page_table = page_table_blocks[:, :max_pages][:, None, :].expand(
+        batch_size, next_n, max_pages
+    )
     metadata = NSAIndexerPagedDecodeMetadata(
-        real_page_table=page_table.reshape(q_rows, block_tables.shape[1]).contiguous(),
+        real_page_table=page_table.reshape(q_rows, max_pages).contiguous(),
         cache_seqlens_int32=seqlens,
     )
     return sparse_nsa_index_decode_logits_paged(
@@ -726,11 +758,10 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    if (
-        current_platform.is_device_capability_family(120)
-        and q[1] is None
-        and not use_deepgemm_sm12x_kernels()
-    ):
+    if current_platform.is_device_capability_family(120) and q[1] is None:
+        # DeepGEMM's SM120 FP8/FP4 MQA logits kernel is unstable for the
+        # DeepSeek V4 indexer workload. Keep DeepGEMM enabled elsewhere, but
+        # route this specific path through b12x first, then Triton/Torch.
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -867,6 +898,9 @@ def _fp8_paged_mqa_logits_sm12x(
             fp8_paged_mqa_logits_triton,
         )
 
+        # DeepGEMM's SM120 paged MQA logits kernel faults on this workload.
+        # Try the 64-token-page b12x decode path first, then fall back to
+        # Triton if b12x still cannot service the shape.
         return fp8_paged_mqa_logits_triton(
             q_values, kv_cache, weights, context_lens, block_tables, max_model_len
         )
@@ -1038,11 +1072,11 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    if (
-        current_platform.is_device_capability_family(120)
-        and q[1] is None
-        and not use_deepgemm_sm12x_kernels()
-    ):
+    if current_platform.is_device_capability_family(120) and q[1] is None:
+        # DeepGEMM's SM120 paged MQA logits kernel faults under benchmark
+        # decode traffic for DeepSeek V4 indexer scoring. Keep DeepGEMM for the
+        # supported GEMM paths and fall back here via b12x first, then
+        # Triton/Torch.
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )

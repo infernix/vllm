@@ -14,9 +14,16 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_packed_ue8m0_int32(scale: torch.Tensor, hidden_scale_blocks: int) -> torch.Tensor:
-    packed = scale.to(torch.int32)
-    shifts = torch.tensor((0, 8, 16, 24), device=scale.device, dtype=torch.int32)
-    exp_bits = ((packed.unsqueeze(-1) >> shifts) & 0xFF).to(torch.int32)
+    packed = scale.to(torch.int32).unsqueeze(-1)
+    exp_bits = torch.cat(
+        (
+            packed & 0xFF,
+            (packed >> 8) & 0xFF,
+            (packed >> 16) & 0xFF,
+            (packed >> 24) & 0xFF,
+        ),
+        dim=-1,
+    ).to(torch.int32)
     fp32_bits = exp_bits << 23
     unpacked = fp32_bits.view(torch.float32)
     unpacked = unpacked.reshape(*scale.shape[:-1], scale.shape[-1] * 4)

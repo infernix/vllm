@@ -23,9 +23,6 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
-    quantize_and_insert_k_cache,
-)
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -271,6 +268,59 @@ class DeepseekCompressor(nn.Module):
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
             )
 
+
+    @staticmethod
+    def _quantize_and_insert_k_cache_torch(
+        k: torch.Tensor,
+        k_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Torch fp8_ds_mla cache insert used on SM120 to avoid Triton faults."""
+        assert k.shape[-1] == 512
+        block_size = k_cache.shape[1]
+        cache_flat = k_cache.reshape(k_cache.shape[0], -1)
+        fp8_dim = 448
+        bf16_dim = 64
+        token_data_size = fp8_dim + bf16_dim * 2
+        scale_dim = 8
+        quant_block = 64
+        fp8_max = 448.0
+        for row_idx in range(k.shape[0]):
+            slot = int(slot_mapping[row_idx].item())
+            if slot < 0:
+                continue
+            block_idx = slot // block_size
+            pos_in_block = slot % block_size
+            cache_block = cache_flat[block_idx]
+            token_data_offset = pos_in_block * token_data_size
+            token_scale_offset = block_size * token_data_size + pos_in_block * scale_dim
+
+            row = k[row_idx].contiguous()
+            fp8_values = row[:fp8_dim].float()
+            for qblock_idx in range(fp8_dim // quant_block):
+                start = qblock_idx * quant_block
+                end = start + quant_block
+                block = fp8_values[start:end]
+                block_max = torch.clamp(block.abs().max(), min=1e-4)
+                exponent = torch.ceil(torch.log2(block_max / fp8_max))
+                scale = torch.exp2(exponent)
+                encoded_scale = torch.clamp(exponent + 127.0, 0.0, 255.0)
+                quantized = torch.clamp(
+                    block / scale, min=-fp8_max, max=fp8_max
+                ).to(current_platform.fp8_dtype())
+                cache_block[token_data_offset + start : token_data_offset + end] = (
+                    quantized.view(torch.uint8)
+                )
+                cache_block[token_scale_offset + qblock_idx] = encoded_scale.to(
+                    torch.uint8
+                )
+            cache_block[token_scale_offset + 7] = torch.zeros(
+                (), device=k.device, dtype=torch.uint8
+            )
+            bf16_bytes = row[fp8_dim:].contiguous().view(torch.uint8)
+            cache_block[
+                token_data_offset + fp8_dim : token_data_offset + token_data_size
+            ] = bf16_bytes
     def _forward_sm120_torch(
         self,
         kv_score: torch.Tensor,
@@ -306,10 +356,11 @@ class DeepseekCompressor(nn.Module):
         ape_rows = torch.remainder(positions, self.compress_ratio).to(torch.long)
         score = score + self.ape[ape_rows].float()
 
-        state_view = state_cache.reshape(-1, state_cache.shape[-1])
         valid_slots = slots[valid_mask].to(torch.long)
-        state_view[valid_slots, :state_width] = kv[valid_mask]
-        state_view[valid_slots, state_width:] = score[valid_mask]
+        valid_block_idx = torch.div(valid_slots, block_size, rounding_mode="floor")
+        valid_pos = torch.remainder(valid_slots, block_size)
+        state_cache[valid_block_idx, valid_pos, :state_width] = kv[valid_mask]
+        state_cache[valid_block_idx, valid_pos, state_width:] = score[valid_mask]
 
         boundary_mask = valid_mask & (
             torch.remainder(positions + 1, self.compress_ratio) == 0
@@ -394,12 +445,10 @@ class DeepseekCompressor(nn.Module):
         out_slot_mapping = torch.tensor(
             kv_out_slots, device=k_tensor.device, dtype=torch.int64
         )
-        quantize_and_insert_k_cache(
+        self._quantize_and_insert_k_cache_torch(
             k_tensor,
             kv_cache,
             out_slot_mapping,
-            block_size=kv_cache.shape[1],
-            is_ue8m0=True,
         )
         return k_tensor
 

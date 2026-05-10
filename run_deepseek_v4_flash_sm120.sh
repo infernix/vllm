@@ -8,8 +8,8 @@ export CUDA_ARCH_LIST="${CUDA_ARCH_LIST:-120a}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0a}"
 export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-100000}"
 export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
-export VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP="${VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:-0}"
-export VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP="${VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP:-0}"
+export VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP="${VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP:-1}"
+export VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP="${VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP:-1}"
 unset PYTORCH_CUDA_ALLOC_CONF || true
 
 PORT="${PORT:-8081}"
@@ -21,14 +21,14 @@ exec ./.venv/bin/vllm serve "$MODEL" \
   --port "$PORT" \
   --trust-remote-code \
   --disable-custom-all-reduce \
-  --no-async-scheduling \
   --enforce-eager \
   --kv-cache-dtype fp8_e4m3 \
   --block-size 256 \
   --max-model-len 500000 \
-  --max-num-batched-tokens 2048 \
-  --gpu-memory-utilization 0.95 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.93 \
   --tensor-parallel-size 2 \
+  --enable-expert-parallel \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \
