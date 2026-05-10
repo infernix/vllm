@@ -160,19 +160,10 @@ def _use_deepseek_v4_sm12x_triton_fp8_einsum(
     b_scale: torch.Tensor,
 ) -> bool:
     capability = current_platform.get_device_capability()
-    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-    supported_scale_dtypes = (torch.float32, e8m0_dtype)
-    has_e8m0_scale = e8m0_dtype is not None and (
-        a_scale.dtype == e8m0_dtype or b_scale.dtype == e8m0_dtype
-    )
     return (
         capability is not None
         and capability.major == 12
         and equation == "bhr,hdr->bhd"
-        and tuple(recipe) == (1, 128, 128)
-        and a_scale.dtype in supported_scale_dtypes
-        and b_scale.dtype in supported_scale_dtypes
-        and (not use_deepgemm_sm12x_kernels() or has_e8m0_scale)
     )
 
 
@@ -477,6 +468,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if aux_streams is not None:
             assert len(aux_streams) >= 3
             aux_streams = aux_streams[:3]
+        if current_platform.is_device_capability_family(120):
+            aux_streams = None
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
@@ -559,9 +552,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
-            aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
-            )
+            aux_stream = None
+            if (
+                self.aux_stream_list is not None
+                and not current_platform.is_device_capability_family(120)
+            ):
+                aux_stream = self.aux_stream_list[0]
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -589,9 +585,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
-            aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
-            )
+            aux_stream = None
+            if (
+                self.aux_stream_list is not None
+                and not current_platform.is_device_capability_family(120)
+            ):
+                aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -700,32 +699,53 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
-    if equation == "bhr,hdr->bhd" and b.dim() == 2:
+    if equation == "bhr,hdr->bhd":
         num_groups = out.shape[1]
         out_rank = out.shape[2]
         hidden_size = a.shape[2]
-        if b.shape[0] % out_rank != 0:
-            raise RuntimeError(
-                "DeepSeek V4 fp8 einsum weight rows must be divisible by "
-                f"out_rank={out_rank}, got {b.shape[0]}"
-            )
-        b_groups = b.shape[0] // out_rank
-        group_start = 0
-        if b_groups != num_groups:
-            if b_groups % num_groups != 0:
+        if b.dim() == 2:
+            if b.shape[0] % out_rank != 0:
                 raise RuntimeError(
-                    "DeepSeek V4 fp8 einsum weight groups must match the "
-                    "TP-local output groups or be an integer multiple of "
-                    f"them, got weight_groups={b_groups}, "
-                    f"output_groups={num_groups}"
+                    "DeepSeek V4 fp8 einsum weight rows must be divisible by "
+                    f"out_rank={out_rank}, got {b.shape[0]}"
                 )
-            group_partitions = b_groups // num_groups
-            group_start = (
-                get_tensor_model_parallel_rank() % group_partitions
-            ) * num_groups
-        b = b.view(b_groups, out_rank, hidden_size)
-        if group_start != 0 or b_groups != num_groups:
-            b = b.narrow(0, group_start, num_groups)
+            b_groups = b.shape[0] // out_rank
+            group_start = 0
+            if b_groups != num_groups:
+                if b_groups % num_groups != 0:
+                    raise RuntimeError(
+                        "DeepSeek V4 fp8 einsum weight groups must match the "
+                        "TP-local output groups or be an integer multiple of "
+                        f"them, got weight_groups={b_groups}, "
+                        f"output_groups={num_groups}"
+                    )
+                group_partitions = b_groups // num_groups
+                group_start = (
+                    get_tensor_model_parallel_rank() % group_partitions
+                ) * num_groups
+            b = b.view(b_groups, out_rank, hidden_size)
+            if group_start != 0 or b_groups != num_groups:
+                b = b.narrow(0, group_start, num_groups)
+        elif b.dim() == 3:
+            b_groups = b.shape[0]
+            group_start = 0
+            if b_groups != num_groups:
+                if b_groups % num_groups != 0:
+                    raise RuntimeError(
+                        "DeepSeek V4 fp8 einsum weight groups must match the "
+                        "TP-local output groups or be an integer multiple of "
+                        f"them, got weight_groups={b_groups}, "
+                        f"output_groups={num_groups}"
+                    )
+                group_partitions = b_groups // num_groups
+                group_start = (
+                    get_tensor_model_parallel_rank() % group_partitions
+                ) * num_groups
+                b = b.narrow(0, group_start, num_groups)
+        else:
+            raise RuntimeError(
+                f"DeepSeek V4 fp8 einsum weight must be rank-2 or rank-3, got rank={b.dim()}"
+            )
 
         if b_scale.dim() == 2:
             scale_mn = recipe[1]
@@ -758,7 +778,7 @@ def deepseek_v4_fp8_einsum(
             if b_groups != num_groups:
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
-        if _use_deepseek_v4_sm12x_triton_fp8_einsum(equation, recipe, a_scale, b_scale):
+        if current_platform.is_device_capability_family(120):
             deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, out)
             return
 
@@ -997,25 +1017,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
-        if not mtp_decode:
-            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                candidate_offset=0,
-                num_candidates=max_swa_len,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                output=output,
-                head_block_size=head_block_size,
-                num_heads=self.num_heads,
-            )
-            if output.shape[1] > self.num_heads:
-                output[:, self.num_heads :].zero_()
-            return
+        # The single-pass paged SWA decode Triton kernel can fault on SM120
+        # under benchmark decode traffic. Keep the Triton backend priority, but
+        # route through the chunked accumulation path below, which uses the same
+        # fp8_ds_mla cache layout and a separate numerically stable sink merge.
 
         (
             swa_max_score,
@@ -1029,18 +1034,35 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_max_score.fill_(float("-inf"))
         swa_denom.zero_()
         swa_acc.zero_()
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=swa_k_cache,
-            slot_ids=swa_indices,
-            lens=swa_lens,
-            block_size=swa_metadata.block_size,
-            scale=self.scale,
-            max_score=swa_max_score,
-            denom=swa_denom,
-            acc=swa_acc,
-            head_block_size=head_block_size,
-        )
+        if mtp_decode:
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                slot_ids=swa_indices,
+                lens=swa_lens,
+                block_size=swa_metadata.block_size,
+                scale=self.scale,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
+                head_block_size=head_block_size,
+            )
+        else:
+            accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                seq_lens=swa_metadata.seq_lens[:num_decodes],
+                gather_lens=swa_lens,
+                block_table=swa_metadata.block_table[:num_decodes],
+                block_size=swa_metadata.block_size,
+                candidate_offset=0,
+                num_candidates=max_swa_len,
+                scale=self.scale,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
+                head_block_size=head_block_size,
+            )
         finish_sparse_mla_attention_with_sink(
             swa_max_score,
             swa_denom,

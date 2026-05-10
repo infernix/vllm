@@ -23,6 +23,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+    quantize_and_insert_k_cache,
+)
 from vllm.v1.attention.ops.deepseek_v4_ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -268,6 +271,138 @@ class DeepseekCompressor(nn.Module):
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
             )
 
+    def _forward_sm120_torch(
+        self,
+        kv_score: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb,
+    ) -> torch.Tensor | None:
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return
+
+        state_metadata = cast(
+            CompressorMetadata, attn_metadata[self.state_cache.prefix]
+        )
+        token_to_req_indices = state_metadata.token_to_req_indices
+        slot_mapping = state_metadata.slot_mapping
+        num_actual = slot_mapping.shape[0]
+        block_table = state_metadata.block_table
+        block_size = state_metadata.block_size
+        state_cache = self.state_cache.kv_cache
+        state_width = state_cache.shape[-1] // 2
+
+        kv, score = kv_score.split(
+            [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+        )
+        kv = kv[:num_actual].float()
+        score = score[:num_actual].float()
+        positions = positions[:num_actual]
+        slots = slot_mapping[:num_actual]
+        valid_mask = slots >= 0
+        if not torch.any(valid_mask):
+            return
+
+        ape_rows = torch.remainder(positions, self.compress_ratio).to(torch.long)
+        score = score + self.ape[ape_rows].float()
+
+        state_view = state_cache.reshape(-1, state_cache.shape[-1])
+        valid_slots = slots[valid_mask].to(torch.long)
+        state_view[valid_slots, :state_width] = kv[valid_mask]
+        state_view[valid_slots, state_width:] = score[valid_mask]
+
+        boundary_mask = valid_mask & (
+            torch.remainder(positions + 1, self.compress_ratio) == 0
+        )
+        if not torch.any(boundary_mask):
+            return
+
+        boundary_indices = torch.nonzero(boundary_mask, as_tuple=False).flatten()
+        boundary_positions = positions[boundary_indices].to(torch.long)
+        boundary_req_indices = token_to_req_indices[boundary_indices].to(torch.long)
+        k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+        compressed_rows: list[torch.Tensor] = []
+        kv_out_slots: list[int] = []
+        cos_sin_cache = rotary_emb.cos_sin_cache
+        head_size = self.head_dim
+        rope_head_dim = self.rope_head_dim
+        half_rope = rope_head_dim // 2
+        for idx, position, req_idx in zip(
+            boundary_indices.tolist(),
+            boundary_positions.tolist(),
+            boundary_req_indices.tolist(),
+            strict=True,
+        ):
+            start = position - (1 + int(self.overlap)) * self.compress_ratio + 1
+            gather_positions = torch.arange(
+                start,
+                start + (1 + int(self.overlap)) * self.compress_ratio,
+                device=positions.device,
+                dtype=torch.long,
+            )
+            gather_mask = gather_positions >= 0
+            if not torch.any(gather_mask):
+                continue
+            gather_positions = gather_positions[gather_mask]
+            block_indices = torch.div(
+                gather_positions, block_size, rounding_mode="floor"
+            )
+            block_numbers = block_table[req_idx, block_indices].to(torch.long)
+            block_offsets = torch.remainder(gather_positions, block_size).to(torch.long)
+            token_rows = state_cache[block_numbers, block_offsets].float()
+            head_offset = (
+                (torch.arange(gather_positions.shape[0], device=positions.device)
+                 >= self.compress_ratio).to(torch.long) * head_size
+            )
+            gather_index = head_offset[:, None] + torch.arange(
+                head_size, device=positions.device, dtype=torch.long
+            )[None, :]
+            kv_state = torch.gather(token_rows[:, :state_width], 1, gather_index)
+            score_state = torch.gather(
+                token_rows[:, state_width:], 1, gather_index
+            )
+            weights = torch.softmax(score_state, dim=0)
+            compressed_kv = (kv_state * weights).sum(dim=0)
+            variance = compressed_kv.square().mean()
+            normed = (
+                compressed_kv
+                * torch.rsqrt(variance + self.rms_norm_eps)
+                * self.norm.weight.float()
+            )
+            compressed_pos = (position // self.compress_ratio) * self.compress_ratio
+            cos = cos_sin_cache[compressed_pos, :half_rope].float()
+            sin = cos_sin_cache[compressed_pos, half_rope:rope_head_dim].float()
+            rope = normed[-rope_head_dim:].view(half_rope, 2)
+            even = rope[:, 0]
+            odd = rope[:, 1]
+            new_even = even * cos - odd * sin
+            new_odd = odd * cos + even * sin
+            normed = normed.clone()
+            normed[-rope_head_dim:] = torch.stack(
+                (new_even, new_odd), dim=1
+            ).reshape(-1)
+            compressed_rows.append(normed.to(torch.bfloat16))
+            kv_out_slots.append(int(k_cache_metadata.slot_mapping[idx].item()))
+
+        if not compressed_rows:
+            return None
+        k_tensor = torch.stack(compressed_rows, dim=0)
+        if self.head_dim != 512:
+            return k_tensor
+        out_slot_mapping = torch.tensor(
+            kv_out_slots, device=k_tensor.device, dtype=torch.int64
+        )
+        quantize_and_insert_k_cache(
+            k_tensor,
+            kv_cache,
+            out_slot_mapping,
+            block_size=kv_cache.shape[1],
+            is_ue8m0=True,
+        )
+        return k_tensor
+
     def forward(
         self,
         # [num_tokens, 2 * self.coff * self.head_dim]
@@ -275,7 +410,10 @@ class DeepseekCompressor(nn.Module):
         # [num_tokens]
         positions: torch.Tensor,
         rotary_emb,
-    ) -> None:
+    ) -> torch.Tensor | None:
+        if current_platform.is_device_capability_family(120):
+            return self._forward_sm120_torch(kv_score, positions, rotary_emb)
+
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
         kv, score = kv_score.split(

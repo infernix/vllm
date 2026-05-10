@@ -166,7 +166,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
-    VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS: bool = False
+    VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS: bool = True
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
@@ -1293,10 +1293,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
-    # Restore externally pinned DeepGEMM SM12x kernels for DeepSeek V4 instead
-    # of the experimental vLLM Triton/scalar compatibility kernels.
+    # Enable externally pinned DeepGEMM SM12x kernels for DeepSeek V4 by default.
+    # Set this to 0 to fall back to the experimental vLLM Triton/scalar
+    # compatibility kernels instead.
     "VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS": lambda: (
-        os.getenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "0").lower()
+        os.getenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1").lower()
         in ("1", "true", "yes", "on")
     ),
     # DeepSeek V4 mHC / hc_head TileLang kernels JIT on first use. Enable

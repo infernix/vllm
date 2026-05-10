@@ -569,6 +569,103 @@ def fp8_fp4_mqa_topk_indices(
     return True
 
 
+def _try_import_b12x_nsa_indexer():
+    try:
+        from b12x.attention.nsa_indexer.api import (
+            NSAIndexerExtendLogitsMetadata,
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_extend_logits,
+        )
+        return (
+            NSAIndexerExtendLogitsMetadata,
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_extend_logits,
+        )
+    except ImportError:
+        return None
+
+
+def _flatten_b12x_index_k_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, int]:
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 kv_cache for b12x, got {kv_cache.dtype}")
+    if kv_cache.dim() == 3:
+        _, block_size, head_dim_with_scale = kv_cache.shape
+    elif kv_cache.dim() == 4:
+        _, block_size, num_kv_heads, head_dim_with_scale = kv_cache.shape
+        if num_kv_heads != 1:
+            raise ValueError(f"Expected one KV head, got {num_kv_heads}")
+    else:
+        raise ValueError(
+            f"Expected 3D or 4D kv_cache for b12x, got {kv_cache.dim()} dimensions"
+        )
+    return kv_cache.contiguous().view(kv_cache.shape[0], block_size * head_dim_with_scale), block_size
+
+
+def _fp8_mqa_logits_b12x(
+    q_values: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor | None:
+    imported = _try_import_b12x_nsa_indexer()
+    if imported is None:
+        return None
+    (
+        NSAIndexerExtendLogitsMetadata,
+        _,
+        _paged_decode,
+        sparse_nsa_index_extend_logits,
+    ) = imported
+    metadata = NSAIndexerExtendLogitsMetadata(
+        k_start=cu_seqlen_ks.contiguous(),
+        k_end=cu_seqlen_ke.contiguous(),
+    )
+    return sparse_nsa_index_extend_logits(
+        q_fp8=q_values,
+        weights=weights,
+        kv_fp8=(kv[0].contiguous(), kv[1].contiguous()),
+        metadata=metadata,
+    )
+
+
+def _fp8_paged_mqa_logits_b12x(
+    q_values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+) -> torch.Tensor | None:
+    imported = _try_import_b12x_nsa_indexer()
+    if imported is None:
+        return None
+    (
+        _,
+        NSAIndexerPagedDecodeMetadata,
+        sparse_nsa_index_decode_logits_paged,
+        _extend_logits,
+    ) = imported
+    index_k_cache, page_size = _flatten_b12x_index_k_cache(kv_cache)
+    batch_size, next_n, num_heads, head_dim = q_values.shape
+    q_rows = batch_size * next_n
+    q_fp8 = q_values.reshape(q_rows, num_heads, head_dim)
+    seqlens = context_lens.reshape(q_rows).contiguous()
+    page_table = block_tables[:, None, :].expand(batch_size, next_n, block_tables.shape[1])
+    metadata = NSAIndexerPagedDecodeMetadata(
+        real_page_table=page_table.reshape(q_rows, block_tables.shape[1]).contiguous(),
+        cache_seqlens_int32=seqlens,
+    )
+    return sparse_nsa_index_decode_logits_paged(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=metadata,
+        page_size=page_size,
+    )
+
+
 def _fp8_mqa_logits_sm12x(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -579,6 +676,14 @@ def _fp8_mqa_logits_sm12x(
 ) -> torch.Tensor:
     q_values, q_scale = q
     if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+        try:
+            b12x_logits = _fp8_mqa_logits_b12x(
+                q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+            )
+            if b12x_logits is not None:
+                return b12x_logits
+        except Exception as exc:
+            logger.warning_once("b12x FP8 MQA fallback failed, using Triton/Torch path: %s", exc)
         from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
             fp8_mqa_logits_triton,
         )
@@ -621,7 +726,11 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        and q[1] is None
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -743,6 +852,17 @@ def _fp8_paged_mqa_logits_sm12x(
         and kv_cache.dtype == torch.uint8
         and kv_cache.shape[-1] == q_values.shape[-1] + 4
     ):
+        try:
+            b12x_logits = _fp8_paged_mqa_logits_b12x(
+                q_values, kv_cache, weights, context_lens, block_tables
+            )
+            if b12x_logits is not None:
+                return b12x_logits
+        except Exception as exc:
+            logger.warning_once(
+                "b12x paged FP8 MQA fallback failed, using Triton/Torch path: %s",
+                exc,
+            )
         from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
             fp8_paged_mqa_logits_triton,
         )
@@ -918,7 +1038,11 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        and q[1] is None
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )

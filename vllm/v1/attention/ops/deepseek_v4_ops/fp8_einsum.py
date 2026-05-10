@@ -13,6 +13,16 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     return fp32_bits.view(torch.float32)
 
 
+def _unpack_packed_ue8m0_int32(scale: torch.Tensor, hidden_scale_blocks: int) -> torch.Tensor:
+    packed = scale.to(torch.int32)
+    shifts = torch.tensor((0, 8, 16, 24), device=scale.device, dtype=torch.int32)
+    exp_bits = ((packed.unsqueeze(-1) >> shifts) & 0xFF).to(torch.int32)
+    fp32_bits = exp_bits << 23
+    unpacked = fp32_bits.view(torch.float32)
+    unpacked = unpacked.reshape(*scale.shape[:-1], scale.shape[-1] * 4)
+    return unpacked[..., :hidden_scale_blocks].contiguous()
+
+
 @triton.jit
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
@@ -124,10 +134,15 @@ def deepseek_v4_sm12x_fp8_einsum(
     assert a.dtype == torch.float8_e4m3fn
     assert b.dtype == torch.float8_e4m3fn
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    hidden_scale_blocks = hidden_size // 128
     if a_scale.dtype == e8m0_dtype:
         a_scale = _upcast_e8m0_to_fp32(a_scale)
+    elif a_scale.dtype == torch.int32:
+        a_scale = _unpack_packed_ue8m0_int32(a_scale, hidden_scale_blocks)
     if b_scale.dtype == e8m0_dtype:
         b_scale = _upcast_e8m0_to_fp32(b_scale)
+    elif b_scale.dtype == torch.int32:
+        b_scale = _unpack_packed_ue8m0_int32(b_scale, hidden_scale_blocks)
     assert a_scale.dtype == torch.float32
     assert b_scale.dtype == torch.float32
 
