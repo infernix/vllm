@@ -21,15 +21,12 @@ exec env -u PYTORCH_CUDA_ALLOC_CONF \
   --host 127.0.0.1 \
   --port "$PORT" \
   --trust-remote-code \
-  --disable-custom-all-reduce \
-  --enforce-eager \
-  --kv-cache-dtype fp8_e4m3 \
+  --kv-cache-dtype fp8 \
   --block-size 256 \
-  --max-model-len 500000 \
-  --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.93 \
+  --max-model-len 131072 \
+  --gpu-memory-utilization 0.95 \
   --tensor-parallel-size 2 \
-  --enable-expert-parallel \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --tokenizer-mode deepseek_v4 \
   --tool-call-parser deepseek_v4 \
   --enable-auto-tool-choice \

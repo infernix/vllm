@@ -883,17 +883,18 @@ def _fp8_paged_mqa_logits_sm12x(
         and kv_cache.dtype == torch.uint8
         and kv_cache.shape[-1] == q_values.shape[-1] + 4
     ):
-        try:
-            b12x_logits = _fp8_paged_mqa_logits_b12x(
-                q_values, kv_cache, weights, context_lens, block_tables
-            )
-            if b12x_logits is not None:
-                return b12x_logits
-        except Exception as exc:
-            logger.warning_once(
-                "b12x paged FP8 MQA fallback failed, using Triton/Torch path: %s",
-                exc,
-            )
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                b12x_logits = _fp8_paged_mqa_logits_b12x(
+                    q_values, kv_cache, weights, context_lens, block_tables
+                )
+                if b12x_logits is not None:
+                    return b12x_logits
+            except Exception as exc:
+                logger.warning_once(
+                    "b12x paged FP8 MQA fallback failed, using Triton/Torch path: %s",
+                    exc,
+                )
         from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
             fp8_paged_mqa_logits_triton,
         )
