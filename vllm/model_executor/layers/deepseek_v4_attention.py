@@ -92,6 +92,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
+    accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
@@ -103,10 +104,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
 )
-from vllm.v1.attention.backends.mla.sparse_swa import (
-    DeepseekV4SWACache,
-    compute_swa_indices_and_lens,
-)
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -1286,8 +1284,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         compressed_block_table: torch.Tensor,
         compressed_block_size: int,
         swa_k_cache: torch.Tensor,
-        swa_slot_ids: torch.Tensor,
-        swa_lens: torch.Tensor,
+        swa_token_to_req_indices: torch.Tensor,
+        swa_query_start_loc: torch.Tensor,
+        swa_seq_lens: torch.Tensor,
+        swa_block_table: torch.Tensor,
+        token_base: int,
         swa_block_size: int,
         output: torch.Tensor,
         state_buffers: tuple[
@@ -1340,13 +1341,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 acc=comp_acc,
                 head_block_size=4,
             )
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
-            slot_ids=swa_slot_ids,
-            lens=swa_lens,
+            token_to_req_indices=swa_token_to_req_indices,
+            query_start_loc=swa_query_start_loc,
+            seq_lens=swa_seq_lens,
+            block_table=swa_block_table,
             block_size=swa_block_size,
-            candidate_offset=0,
+            window_size=self.window_size,
+            global_token_offset=token_base,
             scale=self.scale,
             max_score=swa_max_score,
             denom=swa_denom,
@@ -1371,8 +1375,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         swa_k_cache: torch.Tensor,
-        swa_slot_ids: torch.Tensor,
-        swa_lens: torch.Tensor,
+        swa_token_to_req_indices: torch.Tensor,
+        swa_query_start_loc: torch.Tensor,
+        swa_seq_lens: torch.Tensor,
+        swa_block_table: torch.Tensor,
+        token_base: int,
         swa_block_size: int,
         output: torch.Tensor,
         state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1385,13 +1392,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         max_score.fill_(float("-inf"))
         denom.zero_()
         acc.zero_()
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
-            slot_ids=swa_slot_ids,
-            lens=swa_lens,
+            token_to_req_indices=swa_token_to_req_indices,
+            query_start_loc=swa_query_start_loc,
+            seq_lens=swa_seq_lens,
+            block_table=swa_block_table,
             block_size=swa_block_size,
-            candidate_offset=0,
+            window_size=self.window_size,
+            global_token_offset=token_base,
             scale=self.scale,
             max_score=max_score,
             denom=denom,
@@ -1755,14 +1765,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         if direct_fp8_sparse_prefill_enabled and swa_only:
             (
-                swa_slot_ids_buffer,
-                swa_lens_buffer,
                 swa_only_max_score_buffer,
                 swa_only_denom_buffer,
                 swa_only_acc_buffer,
             ) = workspace_manager.get_simultaneous(
-                ((max_query_chunk_tokens, self.window_size), torch.int32),
-                ((max_query_chunk_tokens,), torch.int32),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
                 ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
@@ -1777,8 +1783,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             direct_prefill_state_buffers = None
         elif direct_fp8_sparse_prefill_enabled:
             (
-                swa_slot_ids_buffer,
-                swa_lens_buffer,
                 comp_max_score_buffer,
                 comp_denom_buffer,
                 comp_acc_buffer,
@@ -1786,8 +1790,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 swa_denom_buffer,
                 swa_acc_buffer,
             ) = workspace_manager.get_simultaneous(
-                ((max_query_chunk_tokens, self.window_size), torch.int32),
-                ((max_query_chunk_tokens,), torch.int32),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
                 ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
@@ -1856,27 +1858,20 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             query_tokens = query_end - query_start
             if direct_fp8_sparse_prefill_enabled and swa_only:
                 assert swa_metadata.token_to_req_indices is not None
-                assert swa_metadata.is_valid_token is not None
                 assert swa_metadata.query_start_loc is not None
                 assert swa_metadata.seq_lens is not None
                 token_start = num_decode_tokens + query_start
                 token_end = num_decode_tokens + query_end
-                swa_slot_ids, swa_lens = compute_swa_indices_and_lens(
-                    token_to_req_indices=swa_metadata.token_to_req_indices[token_start:token_end],
-                    is_valid_token=swa_metadata.is_valid_token[token_start:token_end],
-                    query_start_loc=swa_metadata.query_start_loc,
-                    seq_lens=swa_metadata.seq_lens,
-                    block_table=swa_metadata.block_table,
-                    block_size=swa_metadata.block_size,
-                    window_size=self.window_size,
-                    swa_indices=swa_slot_ids_buffer[:query_tokens],
-                    swa_lens=swa_lens_buffer[:query_tokens],
-                )
                 self._forward_sparse_mla_prefill_fp8ds_swa_only(
                     q=q[query_start:query_end],
                     swa_k_cache=swa_k_cache,
-                    swa_slot_ids=swa_slot_ids,
-                    swa_lens=swa_lens,
+                    swa_token_to_req_indices=swa_metadata.token_to_req_indices[
+                        token_start:token_end
+                    ],
+                    swa_query_start_loc=swa_metadata.query_start_loc,
+                    swa_seq_lens=swa_metadata.seq_lens,
+                    swa_block_table=swa_metadata.block_table,
+                    token_base=int(token_start),
                     swa_block_size=swa_metadata.block_size,
                     output=output[query_start:query_end],
                     state_buffers=swa_only_prefill_state_buffers,
@@ -1886,24 +1881,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
                 assert swa_metadata.token_to_req_indices is not None
-                assert swa_metadata.is_valid_token is not None
                 assert swa_metadata.query_start_loc is not None
                 assert swa_metadata.seq_lens is not None
                 token_start = num_decode_tokens + query_start
                 token_end = num_decode_tokens + query_end
                 local_topk_indices = topk_indices[query_start:query_end]
-                token_to_req_indices = swa_metadata.token_to_req_indices[token_start:token_end]
-                swa_slot_ids, swa_lens = compute_swa_indices_and_lens(
-                    token_to_req_indices=token_to_req_indices,
-                    is_valid_token=swa_metadata.is_valid_token[token_start:token_end],
-                    query_start_loc=swa_metadata.query_start_loc,
-                    seq_lens=swa_metadata.seq_lens,
-                    block_table=swa_metadata.block_table,
-                    block_size=swa_metadata.block_size,
-                    window_size=self.window_size,
-                    swa_indices=swa_slot_ids_buffer[:query_tokens],
-                    swa_lens=swa_lens_buffer[:query_tokens],
-                )
+                token_to_req_indices = swa_metadata.token_to_req_indices[
+                    token_start:token_end
+                ]
                 self._forward_sparse_mla_prefill_fp8ds_direct(
                     q=q[query_start:query_end],
                     compressed_k_cache=compressed_k_cache,
@@ -1912,8 +1897,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     compressed_block_table=attn_metadata.block_table,
                     compressed_block_size=attn_metadata.block_size // self.compress_ratio,
                     swa_k_cache=swa_k_cache,
-                    swa_slot_ids=swa_slot_ids,
-                    swa_lens=swa_lens,
+                    swa_token_to_req_indices=token_to_req_indices,
+                    swa_query_start_loc=swa_metadata.query_start_loc,
+                    swa_seq_lens=swa_metadata.seq_lens,
+                    swa_block_table=swa_metadata.block_table,
+                    token_base=int(token_start),
                     swa_block_size=swa_metadata.block_size,
                     output=output[query_start:query_end],
                     state_buffers=direct_prefill_state_buffers,

@@ -1729,7 +1729,7 @@ def _accumulate_fp8ds_swa_slots_attention_chunk_multihead_kernel(
     )
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-    global_token_idx = global_token_offset + token_idx
+    global_token_idx = token_idx + tl.full((), global_token_offset, tl.int32)
     query_start = tl.load(query_start_loc_ptr + req_idx)
     query_end = tl.load(query_start_loc_ptr + req_idx + 1)
     query_len = query_end - query_start
