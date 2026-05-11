@@ -1662,6 +1662,233 @@ def accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
 
 
 @triton.jit
+def _accumulate_fp8ds_swa_slots_attention_chunk_multihead_kernel(
+    q_ptr,
+    k_cache_ptr,
+    token_to_req_indices_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    max_score_ptr,
+    denom_ptr,
+    acc_ptr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    block_table_stride,
+    stride_state_t: tl.constexpr,
+    stride_state_h: tl.constexpr,
+    stride_acc_t: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    stride_acc_d: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    scale_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    window_size: tl.constexpr,
+    global_token_offset: tl.constexpr,
+    scale: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < head_dim
+    matrix_mask = head_mask[:, None] & dim_mask[None, :]
+
+    q = tl.load(
+        q_ptr
+        + token_idx * stride_q_t
+        + head_offsets[:, None] * stride_q_h
+        + dim_offsets[None, :] * stride_q_d,
+        mask=matrix_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    state_offsets = token_idx * stride_state_t + head_offsets * stride_state_h
+    acc_offsets = (
+        token_idx * stride_acc_t
+        + head_offsets[:, None] * stride_acc_h
+        + dim_offsets[None, :] * stride_acc_d
+    )
+    running_max = tl.load(
+        max_score_ptr + state_offsets,
+        mask=head_mask,
+        other=-float("inf"),
+    )
+    running_denom = tl.load(denom_ptr + state_offsets, mask=head_mask, other=0.0)
+    running_acc = tl.load(acc_ptr + acc_offsets, mask=matrix_mask, other=0.0).to(
+        tl.float32
+    )
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    global_token_idx = global_token_offset + token_idx
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+    pos = prefix_len + global_token_idx - query_start
+    start_pos = tl.where(pos >= (window_size - 1), pos - window_size + 1, 0)
+    end_pos = pos + 1
+    swa_len = end_pos - start_pos
+    fp8_mask = dim_offsets < fp8_dim
+    rope_mask = (dim_offsets >= fp8_dim) & dim_mask
+    rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
+
+    for candidate_idx in range(0, window_size):
+        is_valid = candidate_idx < swa_len
+        if is_valid:
+            pos_offset = start_pos + candidate_idx
+            block_indices = pos_offset // cache_block_size
+            block_numbers = tl.load(
+                block_table_ptr + req_idx * block_table_stride + block_indices,
+                mask=is_valid,
+                other=0,
+            )
+            pos_in_block = pos_offset % cache_block_size
+            cache_block_ptr = k_cache_ptr + block_numbers.to(tl.int64) * block_stride
+            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+            token_scale_ptr = (
+                cache_block_ptr
+                + cache_block_size * token_data_size
+                + pos_in_block * scale_dim
+            )
+
+            x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
+            scale_offsets = dim_offsets // quant_block
+            encoded_scale = tl.load(
+                token_scale_ptr + scale_offsets,
+                mask=fp8_mask,
+                other=127,
+            )
+            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+            x_dequant = x_float * dequant_scale
+
+            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+                tl.float32
+            )
+            kv = tl.where(fp8_mask, x_dequant, rope)
+            kv = tl.where(dim_mask, kv, 0.0)
+
+            score = tl.sum(q * kv[None, :], axis=1) * scale
+            next_max = tl.maximum(running_max, score)
+            previous_weight = tl.exp(running_max - next_max)
+            candidate_weight = tl.exp(score - next_max)
+            running_acc = (
+                running_acc * previous_weight[:, None]
+                + kv[None, :] * candidate_weight[:, None]
+            )
+            running_denom = running_denom * previous_weight + candidate_weight
+            running_max = next_max
+
+    tl.store(max_score_ptr + state_offsets, running_max, mask=head_mask)
+    tl.store(denom_ptr + state_offsets, running_denom, mask=head_mask)
+    tl.store(acc_ptr + acc_offsets, running_acc, mask=matrix_mask)
+
+def accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    window_size: int,
+    global_token_offset: int,
+    scale: float,
+    max_score: torch.Tensor,
+    denom: torch.Tensor,
+    acc: torch.Tensor,
+    head_block_size: int = 2,
+) -> None:
+    if q.dim() == 4:
+        assert q.shape[1] == 1
+        q = q[:, 0]
+
+    assert q.dim() == 3, f"Expected q shape [T, H, D], got {q.shape}"
+    assert q.shape[-1] == 512
+    assert token_to_req_indices.shape[0] == q.shape[0]
+    assert query_start_loc.dtype == torch.int32
+    assert seq_lens.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert max_score.shape[0] == q.shape[0]
+    assert max_score.shape[1] <= q.shape[1]
+    assert denom.shape == max_score.shape
+    assert acc.shape == (*max_score.shape, q.shape[-1])
+    assert head_block_size in (1, 2, 4)
+    assert token_to_req_indices.dtype == torch.int32
+    assert max_score.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert acc.dtype == torch.float32
+    assert k_cache.dtype == torch.uint8
+    assert (
+        q.is_cuda
+        and k_cache.is_cuda
+        and token_to_req_indices.is_cuda
+        and query_start_loc.is_cuda
+        and seq_lens.is_cuda
+        and block_table.is_cuda
+    )
+    assert max_score.is_cuda and denom.is_cuda and acc.is_cuda
+
+    token_fp8_dim = 448
+    token_bf16_dim = 64
+    token_scale_dim = 8
+    quant_block_size = 64
+    token_data_size = token_fp8_dim + token_bf16_dim * 2
+
+    num_tokens, _, head_dim = q.shape
+    num_heads = max_score.shape[1]
+    block_d = min(1024, triton.next_power_of_2(head_dim))
+    grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
+    _accumulate_fp8ds_swa_slots_attention_chunk_multihead_kernel[grid](
+        q,
+        k_cache,
+        token_to_req_indices,
+        query_start_loc,
+        seq_lens,
+        block_table,
+        max_score,
+        denom,
+        acc,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        block_table.stride(0),
+        max_score.stride(0),
+        max_score.stride(1),
+        acc.stride(0),
+        acc.stride(1),
+        acc.stride(2),
+        block_size,
+        token_data_size,
+        k_cache.stride(0),
+        token_fp8_dim,
+        token_scale_dim,
+        quant_block_size,
+        num_heads,
+        head_dim,
+        window_size,
+        global_token_offset,
+        scale,
+        HEAD_BLOCK=head_block_size,
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _accumulate_fp8ds_paged_attention_chunk_kernel(
     q_ptr,
     k_cache_ptr,
