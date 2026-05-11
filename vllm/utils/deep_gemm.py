@@ -1009,9 +1009,39 @@ def fp8_fp4_paged_mqa_topk_indices(
         chunk_topk = min(topk_tokens, token_count)
         chunk_values = chunk_values_buf[:, :chunk_topk]
         chunk_indices = chunk_indices_buf[:, :chunk_topk]
-        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
         chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
-        chunk_indices_out.copy_(chunk_indices)
+        if (
+            current_platform.is_cuda()
+            and chunk_topk == topk_tokens
+            and topk_tokens in (512, 2048)
+        ):
+            local_lens = torch.clamp(
+                context_lens - token_start,
+                min=0,
+                max=token_count,
+            )
+            chunk_indices_out.fill_(-1)
+            torch.ops._C.top_k_per_row_decode(
+                chunk_logits,
+                next_n,
+                local_lens,
+                chunk_indices_out,
+                num_rows,
+                chunk_logits.stride(0),
+                chunk_logits.stride(1),
+                topk_tokens,
+            )
+            chunk_indices.copy_(chunk_indices_out.clamp(min=0))
+            torch.gather(chunk_logits, 1, chunk_indices, out=chunk_values)
+            chunk_values.masked_fill_(chunk_indices_out < 0, float("-inf"))
+        else:
+            torch.topk(
+                chunk_logits,
+                chunk_topk,
+                dim=1,
+                out=(chunk_values, chunk_indices),
+            )
+            chunk_indices_out.copy_(chunk_indices)
         chunk_indices_out.add_(token_start)
 
         candidate_cols = topk_tokens + chunk_topk
