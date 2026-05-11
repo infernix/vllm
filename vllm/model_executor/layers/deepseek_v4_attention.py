@@ -92,6 +92,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
+    accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
     build_combined_sparse_mla_decode_valid_mask,
@@ -1280,8 +1281,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor,
-        compressed_slot_ids: torch.Tensor,
-        topk_lens: torch.Tensor,
+        local_topk_indices: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        compressed_block_table: torch.Tensor,
         compressed_block_size: int,
         swa_k_cache: torch.Tensor,
         swa_slot_ids: torch.Tensor,
@@ -1320,18 +1322,18 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_acc.zero_()
 
         topk_chunk_size = min(
-            compressed_slot_ids.shape[-1],
+            local_topk_indices.shape[-1],
             triton_sparse_mla_topk_chunk_size(),
         )
-        for chunk_start in range(0, compressed_slot_ids.shape[-1], topk_chunk_size):
-            chunk_end = min(chunk_start + topk_chunk_size, compressed_slot_ids.shape[-1])
-            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        for chunk_start in range(0, local_topk_indices.shape[-1], topk_chunk_size):
+            chunk_end = min(chunk_start + topk_chunk_size, local_topk_indices.shape[-1])
+            accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
                 q=q,
                 k_cache=compressed_k_cache,
-                slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
-                lens=topk_lens,
+                local_indices=local_topk_indices[:, chunk_start:chunk_end],
+                token_to_req_indices=token_to_req_indices,
+                block_table=compressed_block_table,
                 block_size=compressed_block_size,
-                candidate_offset=chunk_start,
                 scale=self.scale,
                 max_score=comp_max_score,
                 denom=comp_denom,
@@ -1775,8 +1777,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             direct_prefill_state_buffers = None
         elif direct_fp8_sparse_prefill_enabled:
             (
-                compressed_slot_ids_buffer,
-                topk_lens_buffer,
                 swa_slot_ids_buffer,
                 swa_lens_buffer,
                 comp_max_score_buffer,
@@ -1786,8 +1786,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 swa_denom_buffer,
                 swa_acc_buffer,
             ) = workspace_manager.get_simultaneous(
-                ((max_query_chunk_tokens, top_k), torch.int32),
-                ((max_query_chunk_tokens,), torch.int32),
                 ((max_query_chunk_tokens, self.window_size), torch.int32),
                 ((max_query_chunk_tokens,), torch.int32),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
@@ -1893,17 +1891,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 assert swa_metadata.seq_lens is not None
                 token_start = num_decode_tokens + query_start
                 token_end = num_decode_tokens + query_end
-                compressed_slot_ids, topk_lens = compute_global_topk_indices_and_lens(
-                    topk_indices[query_start:query_end],
-                    swa_metadata.token_to_req_indices[token_start:token_end],
-                    attn_metadata.block_table,
-                    attn_metadata.block_size // self.compress_ratio,
-                    swa_metadata.is_valid_token[token_start:token_end],
-                    global_topk_indices=compressed_slot_ids_buffer[:query_tokens],
-                    topk_lens=topk_lens_buffer[:query_tokens],
-                )
+                local_topk_indices = topk_indices[query_start:query_end]
+                token_to_req_indices = swa_metadata.token_to_req_indices[token_start:token_end]
                 swa_slot_ids, swa_lens = compute_swa_indices_and_lens(
-                    token_to_req_indices=swa_metadata.token_to_req_indices[token_start:token_end],
+                    token_to_req_indices=token_to_req_indices,
                     is_valid_token=swa_metadata.is_valid_token[token_start:token_end],
                     query_start_loc=swa_metadata.query_start_loc,
                     seq_lens=swa_metadata.seq_lens,
@@ -1916,8 +1907,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 self._forward_sparse_mla_prefill_fp8ds_direct(
                     q=q[query_start:query_end],
                     compressed_k_cache=compressed_k_cache,
-                    compressed_slot_ids=compressed_slot_ids,
-                    topk_lens=topk_lens,
+                    local_topk_indices=local_topk_indices,
+                    token_to_req_indices=token_to_req_indices,
+                    compressed_block_table=attn_metadata.block_table,
                     compressed_block_size=attn_metadata.block_size // self.compress_ratio,
                     swa_k_cache=swa_k_cache,
                     swa_slot_ids=swa_slot_ids,
