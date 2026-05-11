@@ -470,8 +470,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if aux_streams is not None:
             assert len(aux_streams) >= 3
             aux_streams = aux_streams[:3]
-        if current_platform.is_device_capability_family(120):
-            aux_streams = None
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
@@ -555,10 +553,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_stream = None
-            if (
-                self.aux_stream_list is not None
-                and not current_platform.is_device_capability_family(120)
-            ):
+            if self.aux_stream_list is not None:
                 aux_stream = self.aux_stream_list[0]
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
@@ -588,10 +583,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = None
-            if (
-                self.aux_stream_list is not None
-                and not current_platform.is_device_capability_family(120)
-            ):
+            if self.aux_stream_list is not None:
                 aux_stream = self.aux_stream_list[0]
             compressor = self.compressor
 
