@@ -476,9 +476,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+        compressor_kv_score_default: Callable[[], torch.Tensor] | None = None
 
         if self.compressor is not None:
-            # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
@@ -488,13 +488,13 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     out_dtype=torch.float32,
                 )
 
+            compressor_kv_score_default = compressor_kv_score
             aux_fns[0] = compressor_kv_score
 
         if self.indexer is not None:
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights
 
@@ -508,8 +508,21 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_fns[1] = indexer_weights_proj
             aux_fns[2] = indexer_compressor_kv_score
 
+        enable_parallel = (
+            hidden_states.shape[0]
+            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        )
+        if (
+            current_platform.is_device_capability_family(120)
+            and hidden_states.shape[0] > envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+            and aux_streams is not None
+            and self.indexer is not None
+            and compressor_kv_score_default is not None
+        ):
+            aux_fns[0] = None
+            enable_parallel = True
+
         def fused_wqa_wkv() -> torch.Tensor:
-            # MergedColumnParallelLinear returns (output, bias); bias is None.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
@@ -519,9 +532,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=enable_parallel,
         )
+        if kv_score is None and compressor_kv_score_default is not None:
+            kv_score = compressor_kv_score_default()
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
