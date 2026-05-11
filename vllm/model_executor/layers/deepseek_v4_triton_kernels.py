@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import LOG2E, tl, triton
 
 DEEPSEEK_V4_MLA_HEAD_DIM = 512
@@ -754,7 +755,21 @@ def fp8_mqa_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    grid = (triton.cdiv(num_q, 8), triton.cdiv(seq_len_kv, 64))
+    if (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and head_dim == 128
+    ):
+        block_m = 16
+        block_n = 128
+        block_d = 128
+        num_warps = 8
+    else:
+        block_m = 8
+        block_n = 64
+        block_d = 64
+        num_warps = 4
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _fp8_mqa_logits_kernel[grid](
         q,
         k_fp8,
@@ -776,10 +791,10 @@ def fp8_mqa_logits_triton(
         weights.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_M=8,
-        BLOCK_N=64,
-        BLOCK_D=64,
-        num_warps=4,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
     )
     return logits
 
