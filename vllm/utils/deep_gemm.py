@@ -498,12 +498,14 @@ def _try_import_b12x_nsa_indexer():
             NSAIndexerExtendLogitsMetadata,
             NSAIndexerPagedDecodeMetadata,
             sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_decode_topk_paged,
             sparse_nsa_index_extend_logits,
         )
         return (
             NSAIndexerExtendLogitsMetadata,
             NSAIndexerPagedDecodeMetadata,
             sparse_nsa_index_decode_logits_paged,
+            sparse_nsa_index_decode_topk_paged,
             sparse_nsa_index_extend_logits,
         )
     except ImportError:
@@ -550,6 +552,7 @@ def _fp8_mqa_logits_b12x(
         NSAIndexerExtendLogitsMetadata,
         _,
         _paged_decode,
+        _paged_decode_topk,
         sparse_nsa_index_extend_logits,
     ) = imported
     metadata = NSAIndexerExtendLogitsMetadata(
@@ -578,6 +581,7 @@ def _fp8_paged_mqa_logits_b12x(
         _,
         NSAIndexerPagedDecodeMetadata,
         sparse_nsa_index_decode_logits_paged,
+        _paged_decode_topk,
         _extend_logits,
     ) = imported
     index_k_cache, page_size = _flatten_b12x_index_k_cache(kv_cache)
@@ -619,6 +623,76 @@ def _fp8_paged_mqa_logits_b12x(
         metadata=metadata,
         page_size=page_size,
     )
+
+def _fp8_paged_mqa_topk_b12x(
+    q_values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    topk_indices: torch.Tensor,
+    effective_model_len: int,
+) -> bool:
+    imported = _try_import_b12x_nsa_indexer()
+    if imported is None:
+        return False
+    (
+        _,
+        NSAIndexerPagedDecodeMetadata,
+        _paged_decode,
+        sparse_nsa_index_decode_topk_paged,
+        _extend_logits,
+    ) = imported
+    index_k_cache, page_size = _flatten_b12x_index_k_cache(kv_cache)
+    batch_size, next_n, num_heads, head_dim = q_values.shape
+    q_rows = batch_size * next_n
+    if q_rows != 1:
+        return False
+    q_fp8 = q_values.reshape(q_rows, num_heads, head_dim)
+    seqlens = context_lens.reshape(q_rows).contiguous()
+    original_block_size = kv_cache.shape[1]
+    page_factor = max(1, original_block_size // page_size)
+    needed_block_cols = max(
+        1, (effective_model_len + original_block_size - 1) // original_block_size
+    )
+    trimmed_block_tables = block_tables[:, :needed_block_cols].contiguous().to(torch.int32)
+    if page_factor > 1:
+        page_offsets = torch.arange(
+            page_factor, device=trimmed_block_tables.device, dtype=torch.int32
+        )
+        expanded_pages = trimmed_block_tables.unsqueeze(-1) * page_factor + page_offsets
+        expanded_pages = torch.where(
+            trimmed_block_tables.unsqueeze(-1) >= 0,
+            expanded_pages,
+            torch.full_like(expanded_pages, -1),
+        )
+        page_table_blocks = expanded_pages.reshape(batch_size, needed_block_cols * page_factor)
+    else:
+        page_table_blocks = trimmed_block_tables
+    max_pages = max(1, (effective_model_len + page_size - 1) // page_size)
+    page_table = page_table_blocks[:, :max_pages][:, None, :].expand(
+        batch_size, next_n, max_pages
+    )
+    active_width = torch.tensor(
+        [effective_model_len],
+        dtype=torch.int32,
+        device=q_values.device,
+    )
+    metadata = NSAIndexerPagedDecodeMetadata(
+        real_page_table=page_table.reshape(q_rows, max_pages).contiguous(),
+        cache_seqlens_int32=seqlens,
+    )
+    sparse_nsa_index_decode_topk_paged(
+        q_fp8=q_fp8,
+        weights=weights,
+        index_k_cache=index_k_cache,
+        metadata=metadata,
+        topk=topk_indices.shape[1],
+        page_size=page_size,
+        output_indices=topk_indices,
+        active_width_override=active_width,
+    )
+    return True
 
 
 def _fp8_mqa_logits_sm12x(
@@ -857,6 +931,7 @@ def fp8_fp4_paged_mqa_topk_indices(
         return False
 
     num_rows = q_values.shape[0] * q_values.shape[1]
+    next_n = q_values.shape[1]
     topk_tokens = topk_indices.shape[1]
     assert topk_indices.shape == (num_rows, topk_tokens)
     assert topk_indices.dtype == torch.int32
@@ -872,6 +947,22 @@ def fp8_fp4_paged_mqa_topk_indices(
         effective_model_len = min(max_model_len, max(0, effective_model_len))
     if effective_model_len == 0:
         return True
+    try:
+        if _fp8_paged_mqa_topk_b12x(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            topk_indices,
+            effective_model_len,
+        ):
+            return True
+    except Exception as exc:
+        logger.warning_once(
+            "b12x paged decode top-k failed, using local Triton chunked path: %s",
+            exc,
+        )
 
     best_values = torch.full(
         (num_rows, topk_tokens),
@@ -912,7 +1003,6 @@ def fp8_fp4_paged_mqa_topk_indices(
         device=q_values.device,
         dtype=torch.int64,
     )
-
     from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
         fp8_paged_mqa_logits_triton,
     )
