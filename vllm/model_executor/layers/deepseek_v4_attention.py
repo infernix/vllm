@@ -1326,36 +1326,51 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             local_topk_indices.shape[-1],
             triton_sparse_mla_topk_chunk_size(),
         )
-        for chunk_start in range(0, local_topk_indices.shape[-1], topk_chunk_size):
-            chunk_end = min(chunk_start + topk_chunk_size, local_topk_indices.shape[-1])
-            accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
+
+        def compressed_path() -> None:
+            for chunk_start in range(0, local_topk_indices.shape[-1], topk_chunk_size):
+                chunk_end = min(
+                    chunk_start + topk_chunk_size,
+                    local_topk_indices.shape[-1],
+                )
+                accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
+                    q=q,
+                    k_cache=compressed_k_cache,
+                    local_indices=local_topk_indices[:, chunk_start:chunk_end],
+                    token_to_req_indices=token_to_req_indices,
+                    block_table=compressed_block_table,
+                    block_size=compressed_block_size,
+                    scale=self.scale,
+                    max_score=comp_max_score,
+                    denom=comp_denom,
+                    acc=comp_acc,
+                    head_block_size=16,
+                )
+
+        def swa_path() -> None:
+            accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
                 q=q,
-                k_cache=compressed_k_cache,
-                local_indices=local_topk_indices[:, chunk_start:chunk_end],
-                token_to_req_indices=token_to_req_indices,
-                block_table=compressed_block_table,
-                block_size=compressed_block_size,
+                k_cache=swa_k_cache,
+                token_to_req_indices=swa_token_to_req_indices,
+                query_start_loc=swa_query_start_loc,
+                seq_lens=swa_seq_lens,
+                block_table=swa_block_table,
+                block_size=swa_block_size,
+                window_size=self.window_size,
+                global_token_offset=token_base,
                 scale=self.scale,
-                max_score=comp_max_score,
-                denom=comp_denom,
-                acc=comp_acc,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
                 head_block_size=16,
             )
-        accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=swa_k_cache,
-            token_to_req_indices=swa_token_to_req_indices,
-            query_start_loc=swa_query_start_loc,
-            seq_lens=swa_seq_lens,
-            block_table=swa_block_table,
-            block_size=swa_block_size,
-            window_size=self.window_size,
-            global_token_offset=token_base,
-            scale=self.scale,
-            max_score=swa_max_score,
-            denom=swa_denom,
-            acc=swa_acc,
-            head_block_size=16,
+
+        maybe_execute_in_parallel(
+            compressed_path,
+            swa_path,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
         )
         finish_two_sparse_mla_attention_states_with_sink(
             comp_max_score,
