@@ -343,7 +343,7 @@ def transform_sf_into_required_layout(*args, **kwargs):
 
 
 _SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
-_SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 8192
+_SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 4096
 
 
 def _fp8_mqa_logits_head_chunk_size(
