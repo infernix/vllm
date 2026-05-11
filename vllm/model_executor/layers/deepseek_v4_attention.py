@@ -1364,6 +1364,47 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
+
+    def _forward_sparse_mla_prefill_fp8ds_swa_only(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_slot_ids: torch.Tensor,
+        swa_lens: torch.Tensor,
+        swa_block_size: int,
+        output: torch.Tensor,
+        state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        max_score_buf, denom_buf, acc_buf = state_buffers
+        num_tokens = q.shape[0]
+        max_score = max_score_buf[:num_tokens]
+        denom = denom_buf[:num_tokens]
+        acc = acc_buf[:num_tokens]
+        max_score.fill_(float("-inf"))
+        denom.zero_()
+        acc.zero_()
+        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+            q=q,
+            k_cache=swa_k_cache,
+            slot_ids=swa_slot_ids,
+            lens=swa_lens,
+            block_size=swa_block_size,
+            candidate_offset=0,
+            scale=self.scale,
+            max_score=max_score,
+            denom=denom,
+            acc=acc,
+            head_block_size=4,
+        )
+        finish_sparse_mla_attention_with_sink(
+            max_score,
+            denom,
+            acc,
+            self.attn_sink,
+            output=output,
+        )
+        if output.shape[1] > self.num_heads:
+            output[:, self.num_heads :].zero_()
     def _forward_sparse_mla_prefill_triton(
         self,
         q: torch.Tensor,
@@ -1709,10 +1750,30 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         direct_fp8_sparse_prefill_enabled = (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(120)
-            and not swa_only
-            and compressed_k_cache is not None
         )
-        if direct_fp8_sparse_prefill_enabled:
+        if direct_fp8_sparse_prefill_enabled and swa_only:
+            (
+                swa_slot_ids_buffer,
+                swa_lens_buffer,
+                swa_only_max_score_buffer,
+                swa_only_denom_buffer,
+                swa_only_acc_buffer,
+            ) = workspace_manager.get_simultaneous(
+                ((max_query_chunk_tokens, self.window_size), torch.int32),
+                ((max_query_chunk_tokens,), torch.int32),
+                ((max_query_chunk_tokens, self.num_heads), torch.float32),
+                ((max_query_chunk_tokens, self.num_heads), torch.float32),
+                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
+            )
+            swa_only_prefill_state_buffers = (
+                swa_only_max_score_buffer,
+                swa_only_denom_buffer,
+                swa_only_acc_buffer,
+            )
+            kv = combined_indices_buffer = combined_lens_buffer = None
+            prefill_state_buffers = None
+            direct_prefill_state_buffers = None
+        elif direct_fp8_sparse_prefill_enabled:
             (
                 compressed_slot_ids_buffer,
                 topk_lens_buffer,
@@ -1744,6 +1805,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 swa_denom_buffer,
                 swa_acc_buffer,
             )
+            swa_only_prefill_state_buffers = None
             kv = combined_indices_buffer = combined_lens_buffer = None
             prefill_state_buffers = None
         elif triton_sparse_mla_enabled:
@@ -1769,6 +1831,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output_buffer,
             )
             direct_prefill_state_buffers = None
+            swa_only_prefill_state_buffers = None
         else:
             (
                 kv,
@@ -1781,6 +1844,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
             prefill_state_buffers = None
             direct_prefill_state_buffers = None
+            swa_only_prefill_state_buffers = None
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
@@ -1792,6 +1856,34 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
             query_tokens = query_end - query_start
+            if direct_fp8_sparse_prefill_enabled and swa_only:
+                assert swa_metadata.token_to_req_indices is not None
+                assert swa_metadata.is_valid_token is not None
+                assert swa_metadata.query_start_loc is not None
+                assert swa_metadata.seq_lens is not None
+                token_start = num_decode_tokens + query_start
+                token_end = num_decode_tokens + query_end
+                swa_slot_ids, swa_lens = compute_swa_indices_and_lens(
+                    token_to_req_indices=swa_metadata.token_to_req_indices[token_start:token_end],
+                    is_valid_token=swa_metadata.is_valid_token[token_start:token_end],
+                    query_start_loc=swa_metadata.query_start_loc,
+                    seq_lens=swa_metadata.seq_lens,
+                    block_table=swa_metadata.block_table,
+                    block_size=swa_metadata.block_size,
+                    window_size=self.window_size,
+                    swa_indices=swa_slot_ids_buffer[:query_tokens],
+                    swa_lens=swa_lens_buffer[:query_tokens],
+                )
+                self._forward_sparse_mla_prefill_fp8ds_swa_only(
+                    q=q[query_start:query_end],
+                    swa_k_cache=swa_k_cache,
+                    swa_slot_ids=swa_slot_ids,
+                    swa_lens=swa_lens,
+                    swa_block_size=swa_metadata.block_size,
+                    output=output[query_start:query_end],
+                    state_buffers=swa_only_prefill_state_buffers,
+                )
+                continue
             if direct_fp8_sparse_prefill_enabled:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
