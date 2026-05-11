@@ -1598,7 +1598,7 @@ def accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
     assert max_score.shape[1] <= q.shape[1]
     assert denom.shape == max_score.shape
     assert acc.shape == (*max_score.shape, q.shape[-1])
-    assert head_block_size in (1, 2, 4, 8)
+    assert head_block_size in (1, 2, 4, 8, 16)
     assert token_to_req_indices.dtype == torch.int32
     assert block_table.dtype == torch.int32
     assert max_score.dtype == torch.float32
@@ -1826,7 +1826,7 @@ def accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
     assert max_score.shape[1] <= q.shape[1]
     assert denom.shape == max_score.shape
     assert acc.shape == (*max_score.shape, q.shape[-1])
-    assert head_block_size in (1, 2, 4, 8)
+    assert head_block_size in (1, 2, 4, 8, 16)
     assert token_to_req_indices.dtype == torch.int32
     assert max_score.dtype == torch.float32
     assert denom.dtype == torch.float32
