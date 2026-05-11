@@ -23,7 +23,7 @@ exec env -u PYTORCH_CUDA_ALLOC_CONF \
   --trust-remote-code \
   --kv-cache-dtype fp8 \
   --block-size 256 \
-  --max-model-len 131072 \
+  --max-model-len 500000 \
   --gpu-memory-utilization 0.99 \
   --tensor-parallel-size 2 \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
