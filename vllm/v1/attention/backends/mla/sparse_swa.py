@@ -538,3 +538,61 @@ def _compute_swa_indices_and_lens_kernel(
             slot_ids,
             mask=offset < window_size,
         )
+
+def compute_swa_indices_and_lens(
+    *,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    window_size: int,
+    swa_indices: torch.Tensor | None = None,
+    swa_lens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = token_to_req_indices.shape[0]
+    assert token_to_req_indices.dtype == torch.int32
+    assert query_start_loc.dtype == torch.int32
+    assert seq_lens.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert token_to_req_indices.is_cuda
+    assert is_valid_token.is_cuda
+    assert query_start_loc.is_cuda
+    assert seq_lens.is_cuda
+    assert block_table.is_cuda
+    if swa_indices is None:
+        swa_indices = torch.empty(
+            (num_tokens, window_size),
+            dtype=torch.int32,
+            device=token_to_req_indices.device,
+        )
+    else:
+        assert swa_indices.shape == (num_tokens, window_size)
+        assert swa_indices.dtype == torch.int32
+        assert swa_indices.device == token_to_req_indices.device
+    if swa_lens is None:
+        swa_lens = torch.empty(
+            (num_tokens,),
+            dtype=torch.int32,
+            device=token_to_req_indices.device,
+        )
+    else:
+        assert swa_lens.shape == (num_tokens,)
+        assert swa_lens.dtype == torch.int32
+        assert swa_lens.device == token_to_req_indices.device
+    _compute_swa_indices_and_lens_kernel[(num_tokens,)](
+        swa_indices,
+        swa_indices.stride(0),
+        swa_lens,
+        window_size,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        TRITON_BLOCK_SIZE=128,
+    )
+    return swa_indices, swa_lens
