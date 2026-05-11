@@ -1172,7 +1172,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 output=output,
                 num_heads=self.num_heads,
                 score_buffer=score_buffer,
-                value_block_size=512 if use_dot_finish else 256,
+                value_block_size=128 if use_dot_finish else 256,
                 candidate_block_size=128 if use_dot_finish else None,
             )
             return
