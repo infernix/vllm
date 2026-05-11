@@ -1339,7 +1339,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 max_score=comp_max_score,
                 denom=comp_denom,
                 acc=comp_acc,
-                head_block_size=4,
+                head_block_size=8,
             )
         accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
             q=q,
@@ -1355,7 +1355,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=swa_max_score,
             denom=swa_denom,
             acc=swa_acc,
-            head_block_size=4,
+            head_block_size=8,
         )
         finish_two_sparse_mla_attention_states_with_sink(
             comp_max_score,
@@ -1406,7 +1406,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_score=max_score,
             denom=denom,
             acc=acc,
-            head_block_size=4,
+            head_block_size=8,
         )
         finish_sparse_mla_attention_with_sink(
             max_score,
