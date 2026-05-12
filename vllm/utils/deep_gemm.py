@@ -433,35 +433,112 @@ def _fp8_mqa_logits_topk_torch(
     q_values, q_scale = q
     if q_scale is not None:
         raise NotImplementedError("SM120 MQA top-k torch path only supports FP8 Q")
-    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
-        fp8_mqa_logits_triton,
-    )
 
-    logits = fp8_mqa_logits_triton(
-        q_values,
-        kv,
-        weights,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-    )
-    num_rows = logits.shape[0]
+    k_values, k_scales = kv
+    k_f32 = k_values.to(torch.float32)
+    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
+    k_t = k_f32.transpose(0, 1).contiguous()
+
+    seq_len, num_heads, _ = q_values.shape
+    seq_len_kv = k_f32.shape[0]
     if out is None:
         out = torch.empty(
-            (num_rows, topk_tokens), device=q_values.device, dtype=torch.int32
+            (seq_len, topk_tokens), device=q_values.device, dtype=torch.int32
         )
     else:
-        assert out.shape == (num_rows, topk_tokens)
+        assert out.shape == (seq_len, topk_tokens)
         assert out.dtype == torch.int32
-    torch.ops._C.top_k_per_row_prefill(
-        logits,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-        out,
-        num_rows,
-        logits.stride(0),
-        logits.stride(1),
-        topk_tokens,
+    out.fill_(-1)
+
+    best_values = torch.full(
+        (seq_len, topk_tokens),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
     )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
+    k_chunk_size = _fp8_mqa_logits_k_chunk_size(seq_len, seq_len_kv, head_chunk_size)
+    max_chunk_topk = min(topk_tokens, k_chunk_size)
+    chunk_values_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    chunk_indices_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+    chunk_indices_i32 = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    candidate_values = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    candidate_indices = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    next_best_values = torch.empty_like(best_values)
+    selected = torch.empty(
+        (seq_len, topk_tokens),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+
+    for k_start in range(0, seq_len_kv, k_chunk_size):
+        k_end = min(k_start + k_chunk_size, seq_len_kv)
+        chunk_logits = torch.zeros(
+            (seq_len, k_end - k_start),
+            device=q_values.device,
+            dtype=torch.float32,
+        )
+        for head_start in range(0, num_heads, head_chunk_size):
+            head_end = min(head_start + head_chunk_size, num_heads)
+            q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+            q_chunk = q_chunk.transpose(0, 1).contiguous()
+            head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
+            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            scores.relu_()
+            scores.mul_(head_weights)
+            chunk_logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
+
+        offsets = torch.arange(k_start, k_end, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None]
+        )
+        chunk_logits.masked_fill_(~valid, float("-inf"))
+
+        chunk_topk = min(topk_tokens, k_end - k_start)
+        chunk_values = chunk_values_buf[:, :chunk_topk]
+        chunk_indices = chunk_indices_buf[:, :chunk_topk]
+        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
+        chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
+        chunk_indices_out.copy_(chunk_indices)
+        chunk_indices_out.add_(k_start)
+
+        candidate_cols = topk_tokens + chunk_topk
+        candidate_values_view = candidate_values[:, :candidate_cols]
+        candidate_indices_view = candidate_indices[:, :candidate_cols]
+        candidate_values_view[:, :topk_tokens].copy_(best_values)
+        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+        candidate_indices_view[:, :topk_tokens].copy_(out)
+        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(chunk_indices_out)
+        torch.topk(
+            candidate_values_view,
+            topk_tokens,
+            dim=1,
+            out=(next_best_values, selected),
+        )
+        torch.gather(candidate_indices_view, 1, selected, out=out)
+        best_values, next_best_values = next_best_values, best_values
+        out.masked_fill_(~torch.isfinite(best_values), -1)
+
     return out
 
 
