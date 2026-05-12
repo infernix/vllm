@@ -102,7 +102,13 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     matmul_sparse_mla_attention_with_sink,
+    merge_sparse_mla_subset_with_sink,
+    merge_two_sparse_mla_subsets_with_sink,
     sparse_mla_decode_head_block_size,
+)
+from vllm.v1.attention.backends.mla.prefill_subset_fp8ds import (
+    finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead,
+    finalize_fp8ds_swa_slots_sparse_mla_attention_subset_multihead,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -1307,54 +1313,38 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             torch.Tensor,
             torch.Tensor,
             torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
         ],
     ) -> None:
         (
-            comp_max_score_buf,
-            comp_denom_buf,
-            comp_acc_buf,
-            swa_max_score_buf,
-            swa_denom_buf,
-            swa_acc_buf,
+            comp_subset_output_buf,
+            comp_subset_lse_buf,
+            swa_subset_output_buf,
+            swa_subset_lse_buf,
         ) = state_buffers
         num_tokens = q.shape[0]
-        comp_max_score = comp_max_score_buf[:num_tokens]
-        comp_denom = comp_denom_buf[:num_tokens]
-        comp_acc = comp_acc_buf[:num_tokens]
-        swa_max_score = swa_max_score_buf[:num_tokens]
-        swa_denom = swa_denom_buf[:num_tokens]
-        swa_acc = swa_acc_buf[:num_tokens]
-
-        topk_chunk_size = min(
-            local_topk_indices.shape[-1],
-            triton_sparse_mla_topk_chunk_size(),
-        )
+        comp_subset_output = comp_subset_output_buf[:num_tokens]
+        comp_subset_lse = comp_subset_lse_buf[:num_tokens]
+        swa_subset_output = swa_subset_output_buf[:num_tokens]
+        swa_subset_lse = swa_subset_lse_buf[:num_tokens]
+        active_output = output[:, :self.num_heads]
+        active_sink = self.attn_sink[:self.num_heads]
 
         def compressed_path() -> None:
-            for chunk_start in range(0, local_topk_indices.shape[-1], topk_chunk_size):
-                chunk_end = min(
-                    chunk_start + topk_chunk_size,
-                    local_topk_indices.shape[-1],
-                )
-                accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
-                    q=q,
-                    k_cache=compressed_k_cache,
-                    local_indices=local_topk_indices[:, chunk_start:chunk_end],
-                    token_to_req_indices=token_to_req_indices,
-                    block_table=compressed_block_table,
-                    block_size=compressed_block_size,
-                    scale=self.scale,
-                    max_score=comp_max_score,
-                    denom=comp_denom,
-                    acc=comp_acc,
-                    head_block_size=16,
-                    init_state=(chunk_start == 0),
-                )
+            finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
+                q=q,
+                k_cache=compressed_k_cache,
+                local_indices=local_topk_indices,
+                token_to_req_indices=token_to_req_indices,
+                block_table=compressed_block_table,
+                block_size=compressed_block_size,
+                scale=self.scale,
+                subset_output=comp_subset_output,
+                subset_lse=comp_subset_lse,
+                head_block_size=16,
+            )
 
         def swa_path() -> None:
-            accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
+            finalize_fp8ds_swa_slots_sparse_mla_attention_subset_multihead(
                 q=q,
                 k_cache=swa_k_cache,
                 token_to_req_indices=swa_token_to_req_indices,
@@ -1365,11 +1355,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 window_size=self.window_size,
                 global_token_offset=token_base,
                 scale=self.scale,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
+                subset_output=swa_subset_output,
+                subset_lse=swa_subset_lse,
                 head_block_size=16,
-                init_state=True,
             )
 
         maybe_execute_in_parallel(
@@ -1379,15 +1367,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.ln_events[1],
             self.aux_stream,
         )
-        finish_two_sparse_mla_attention_states_with_sink(
-            comp_max_score,
-            comp_denom,
-            comp_acc,
-            swa_max_score,
-            swa_denom,
-            swa_acc,
-            self.attn_sink,
-            output=output,
+        merge_two_sparse_mla_subsets_with_sink(
+            comp_subset_output,
+            comp_subset_lse,
+            swa_subset_output,
+            swa_subset_lse,
+            active_sink,
+            active_output,
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
@@ -1404,14 +1390,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         token_base: int,
         swa_block_size: int,
         output: torch.Tensor,
-        state_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        state_buffers: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        max_score_buf, denom_buf, acc_buf = state_buffers
+        subset_output_buf, subset_lse_buf = state_buffers
         num_tokens = q.shape[0]
-        max_score = max_score_buf[:num_tokens]
-        denom = denom_buf[:num_tokens]
-        acc = acc_buf[:num_tokens]
-        accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
+        subset_output = subset_output_buf[:num_tokens]
+        subset_lse = subset_lse_buf[:num_tokens]
+        active_output = output[:, :self.num_heads]
+        active_sink = self.attn_sink[:self.num_heads]
+        finalize_fp8ds_swa_slots_sparse_mla_attention_subset_multihead(
             q=q,
             k_cache=swa_k_cache,
             token_to_req_indices=swa_token_to_req_indices,
@@ -1422,18 +1409,15 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             window_size=self.window_size,
             global_token_offset=token_base,
             scale=self.scale,
-            max_score=max_score,
-            denom=denom,
-            acc=acc,
+            subset_output=subset_output,
+            subset_lse=subset_lse,
             head_block_size=16,
-            init_state=True,
         )
-        finish_sparse_mla_attention_with_sink(
-            max_score,
-            denom,
-            acc,
-            self.attn_sink,
-            output=output,
+        merge_sparse_mla_subset_with_sink(
+            subset_output,
+            subset_lse,
+            active_sink,
+            active_output,
         )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
@@ -1785,45 +1769,36 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         if direct_fp8_sparse_prefill_enabled and swa_only:
             (
-                swa_only_max_score_buffer,
-                swa_only_denom_buffer,
-                swa_only_acc_buffer,
+                swa_only_subset_output_buffer,
+                swa_only_subset_lse_buffer,
             ) = workspace_manager.get_simultaneous(
+                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), q.dtype),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
             )
             swa_only_prefill_state_buffers = (
-                swa_only_max_score_buffer,
-                swa_only_denom_buffer,
-                swa_only_acc_buffer,
+                swa_only_subset_output_buffer,
+                swa_only_subset_lse_buffer,
             )
             kv = combined_indices_buffer = combined_lens_buffer = None
             prefill_state_buffers = None
             direct_prefill_state_buffers = None
         elif direct_fp8_sparse_prefill_enabled:
             (
-                comp_max_score_buffer,
-                comp_denom_buffer,
-                comp_acc_buffer,
-                swa_max_score_buffer,
-                swa_denom_buffer,
-                swa_acc_buffer,
+                comp_subset_output_buffer,
+                comp_subset_lse_buffer,
+                swa_subset_output_buffer,
+                swa_subset_lse_buffer,
             ) = workspace_manager.get_simultaneous(
+                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), q.dtype),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
+                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), q.dtype),
                 ((max_query_chunk_tokens, self.num_heads), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads), torch.float32),
-                ((max_query_chunk_tokens, self.num_heads, q.shape[-1]), torch.float32),
             )
             direct_prefill_state_buffers = (
-                comp_max_score_buffer,
-                comp_denom_buffer,
-                comp_acc_buffer,
-                swa_max_score_buffer,
-                swa_denom_buffer,
-                swa_acc_buffer,
+                comp_subset_output_buffer,
+                comp_subset_lse_buffer,
+                swa_subset_output_buffer,
+                swa_subset_lse_buffer,
             )
             swa_only_prefill_state_buffers = None
             kv = combined_indices_buffer = combined_lens_buffer = None
