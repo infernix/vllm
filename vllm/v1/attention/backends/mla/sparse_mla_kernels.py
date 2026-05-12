@@ -64,11 +64,21 @@ def _merge_two_subsets_with_sink_kernel(
     lse0 = tl.load(lse0_ptr + token_idx * stride_lse0_t + head_idx * stride_lse0_h)
     lse1 = tl.load(lse1_ptr + token_idx * stride_lse1_t + head_idx * stride_lse1_h)
     sink = tl.load(sink_ptr + head_idx)
-    merge_max = tl.maximum(tl.maximum(lse0, lse1), sink)
-
-    weight0 = tl.exp(lse0 - merge_max)
-    weight1 = tl.exp(lse1 - merge_max)
-    weight_sink = tl.exp(sink - merge_max)
+    has0 = lse0 > -float("inf")
+    has1 = lse1 > -float("inf")
+    has_sink = sink > -float("inf")
+    merge_max = tl.maximum(
+        tl.maximum(
+            tl.where(has0, lse0, -float("inf")),
+            tl.where(has1, lse1, -float("inf")),
+        ),
+        tl.where(has_sink, sink, -float("inf")),
+    )
+    has_any = has0 | has1 | has_sink
+    safe_merge_max = tl.where(has_any, merge_max, 0.0)
+    weight0 = tl.where(has0, tl.exp(lse0 - safe_merge_max), 0.0)
+    weight1 = tl.where(has1, tl.exp(lse1 - safe_merge_max), 0.0)
+    weight_sink = tl.where(has_sink, tl.exp(sink - safe_merge_max), 0.0)
     denom = weight0 + weight1 + weight_sink
 
     out0_offsets = (
@@ -100,7 +110,7 @@ def _merge_two_subsets_with_sink_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-    merged = (out0 * weight0 + out1 * weight1) / denom
+    merged = (out0 * weight0 + out1 * weight1) / tl.where(denom > 0.0, denom, 1.0)
     if tl.constexpr(FULL_BLOCK):
         tl.store(output_ptr + output_offsets, merged)
     else:
@@ -191,10 +201,16 @@ def _merge_single_subset_with_sink_kernel(
         subset_lse_ptr + token_idx * stride_lse_t + head_idx * stride_lse_h
     )
     sink = tl.load(sink_ptr + head_idx)
-    merge_max = tl.maximum(subset_lse, sink)
-
-    subset_weight = tl.exp(subset_lse - merge_max)
-    sink_weight = tl.exp(sink - merge_max)
+    has_subset = subset_lse > -float("inf")
+    has_sink = sink > -float("inf")
+    merge_max = tl.maximum(
+        tl.where(has_subset, subset_lse, -float("inf")),
+        tl.where(has_sink, sink, -float("inf")),
+    )
+    has_any = has_subset | has_sink
+    safe_merge_max = tl.where(has_any, merge_max, 0.0)
+    subset_weight = tl.where(has_subset, tl.exp(subset_lse - safe_merge_max), 0.0)
+    sink_weight = tl.where(has_sink, tl.exp(sink - safe_merge_max), 0.0)
     denom = subset_weight + sink_weight
     subset_offsets = (
         token_idx * stride_subset_t
@@ -214,7 +230,7 @@ def _merge_single_subset_with_sink_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-    merged = subset_output * subset_weight / denom
+    merged = subset_output * subset_weight / tl.where(denom > 0.0, denom, 1.0)
     if tl.constexpr(FULL_BLOCK):
         tl.store(output_ptr + output_offsets, merged)
     else:
