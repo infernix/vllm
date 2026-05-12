@@ -113,6 +113,7 @@ print(
     f"METRIC prefill_s={prefill_s:g} "
     f"token_gen_s={token_gen_s:g} "
     f"estonia_correctness_rate={correctness_rate:g} "
-    f"estonia_correct={correct}/{completed}"
+    f"estonia_correct={correct:g} "
+    f"estonia_completed={completed:g}"
 )
 PY
