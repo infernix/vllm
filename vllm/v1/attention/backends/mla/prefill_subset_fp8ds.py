@@ -39,6 +39,7 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FULL_TILE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
@@ -48,14 +49,19 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
     dim_mask = dim_offsets < head_dim
     matrix_mask = head_mask[:, None] & dim_mask[None, :]
 
-    q = tl.load(
-        q_ptr
-        + token_idx * stride_q_t
+    q_offsets = (
+        token_idx * stride_q_t
         + head_offsets[:, None] * stride_q_h
-        + dim_offsets[None, :] * stride_q_d,
-        mask=matrix_mask,
-        other=0.0,
-    ).to(tl.float32)
+        + dim_offsets[None, :] * stride_q_d
+    )
+    if tl.constexpr(FULL_TILE):
+        q = tl.load(q_ptr + q_offsets).to(tl.float32)
+    else:
+        q = tl.load(
+            q_ptr + q_offsets,
+            mask=matrix_mask,
+            other=0.0,
+        ).to(tl.float32)
     running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
     running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
     running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
@@ -130,8 +136,12 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
         + dim_offsets[None, :] * stride_subset_d
     )
     lse_offsets = token_idx * stride_lse_t + head_offsets * stride_lse_h
-    tl.store(subset_output_ptr + subset_offsets, subset, mask=matrix_mask)
-    tl.store(subset_lse_ptr + lse_offsets, lse, mask=head_mask)
+    if tl.constexpr(FULL_TILE):
+        tl.store(subset_output_ptr + subset_offsets, subset)
+        tl.store(subset_lse_ptr + lse_offsets, lse)
+    else:
+        tl.store(subset_output_ptr + subset_offsets, subset, mask=matrix_mask)
+        tl.store(subset_lse_ptr + lse_offsets, lse, mask=head_mask)
 
 
 @triton.jit
@@ -166,6 +176,7 @@ def _finalize_fp8ds_swa_subset_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FULL_TILE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
@@ -175,14 +186,19 @@ def _finalize_fp8ds_swa_subset_multihead_kernel(
     dim_mask = dim_offsets < head_dim
     matrix_mask = head_mask[:, None] & dim_mask[None, :]
 
-    q = tl.load(
-        q_ptr
-        + token_idx * stride_q_t
+    q_offsets = (
+        token_idx * stride_q_t
         + head_offsets[:, None] * stride_q_h
-        + dim_offsets[None, :] * stride_q_d,
-        mask=matrix_mask,
-        other=0.0,
-    ).to(tl.float32)
+        + dim_offsets[None, :] * stride_q_d
+    )
+    if tl.constexpr(FULL_TILE):
+        q = tl.load(q_ptr + q_offsets).to(tl.float32)
+    else:
+        q = tl.load(
+            q_ptr + q_offsets,
+            mask=matrix_mask,
+            other=0.0,
+        ).to(tl.float32)
     running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
     running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
     running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
@@ -264,8 +280,12 @@ def _finalize_fp8ds_swa_subset_multihead_kernel(
         + dim_offsets[None, :] * stride_subset_d
     )
     lse_offsets = token_idx * stride_lse_t + head_offsets * stride_lse_h
-    tl.store(subset_output_ptr + subset_offsets, subset, mask=matrix_mask)
-    tl.store(subset_lse_ptr + lse_offsets, lse, mask=head_mask)
+    if tl.constexpr(FULL_TILE):
+        tl.store(subset_output_ptr + subset_offsets, subset)
+        tl.store(subset_lse_ptr + lse_offsets, lse)
+    else:
+        tl.store(subset_output_ptr + subset_offsets, subset, mask=matrix_mask)
+        tl.store(subset_lse_ptr + lse_offsets, lse, mask=head_mask)
 
 
 def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
@@ -297,6 +317,7 @@ def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
     num_heads = subset_lse.shape[1]
     num_candidates = local_indices.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
+    full_tile = num_heads % head_block_size == 0 and head_dim == block_d
     grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
     _finalize_fp8ds_local_slots_subset_multihead_kernel[grid](
         q,
@@ -329,6 +350,7 @@ def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
+        FULL_TILE=full_tile,
         num_warps=8,
     )
 
@@ -361,6 +383,7 @@ def finalize_fp8ds_swa_slots_sparse_mla_attention_subset_multihead(
     num_tokens, _, head_dim = q.shape
     num_heads = subset_lse.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
+    full_tile = num_heads % head_block_size == 0 and head_dim == block_d
     grid = (num_tokens, triton.cdiv(num_heads, head_block_size))
     _finalize_fp8ds_swa_subset_multihead_kernel[grid](
         q,
@@ -393,5 +416,6 @@ def finalize_fp8ds_swa_slots_sparse_mla_attention_subset_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
+        FULL_TILE=full_tile,
         num_warps=8,
     )

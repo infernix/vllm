@@ -52,6 +52,7 @@ def _merge_two_subsets_with_sink_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FULL_BLOCK: tl.constexpr,
 ):
     token_head = tl.program_id(0)
     block_d = tl.program_id(1)
@@ -70,31 +71,40 @@ def _merge_two_subsets_with_sink_kernel(
     weight_sink = tl.exp(sink - merge_max)
     denom = weight0 + weight1 + weight_sink
 
-    out0 = tl.load(
-        out0_ptr
-        + token_idx * stride_out0_t
+    out0_offsets = (
+        token_idx * stride_out0_t
         + head_idx * stride_out0_h
-        + offsets * stride_out0_d,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    out1 = tl.load(
-        out1_ptr
-        + token_idx * stride_out1_t
-        + head_idx * stride_out1_h
-        + offsets * stride_out1_d,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    merged = (out0 * weight0 + out1 * weight1) / denom
-    tl.store(
-        output_ptr
-        + token_idx * stride_output_t
-        + head_idx * stride_output_h
-        + offsets * stride_output_d,
-        merged,
-        mask=mask,
+        + offsets * stride_out0_d
     )
+    out1_offsets = (
+        token_idx * stride_out1_t
+        + head_idx * stride_out1_h
+        + offsets * stride_out1_d
+    )
+    output_offsets = (
+        token_idx * stride_output_t
+        + head_idx * stride_output_h
+        + offsets * stride_output_d
+    )
+    if tl.constexpr(FULL_BLOCK):
+        out0 = tl.load(out0_ptr + out0_offsets).to(tl.float32)
+        out1 = tl.load(out1_ptr + out1_offsets).to(tl.float32)
+    else:
+        out0 = tl.load(
+            out0_ptr + out0_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        out1 = tl.load(
+            out1_ptr + out1_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    merged = (out0 * weight0 + out1 * weight1) / denom
+    if tl.constexpr(FULL_BLOCK):
+        tl.store(output_ptr + output_offsets, merged)
+    else:
+        tl.store(output_ptr + output_offsets, merged, mask=mask)
 
 
 def merge_two_sparse_mla_subsets_with_sink(
@@ -121,6 +131,7 @@ def merge_two_sparse_mla_subsets_with_sink(
     else:
         block_d = min(128, triton.next_power_of_2(head_dim))
         num_warps = 4
+    full_block = head_dim % block_d == 0
     grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
     _merge_two_subsets_with_sink_kernel[grid](
         subset0_output,
@@ -145,6 +156,7 @@ def merge_two_sparse_mla_subsets_with_sink(
         num_heads,
         head_dim,
         BLOCK_D=block_d,
+        FULL_BLOCK=full_block,
         num_warps=num_warps,
     )
 
@@ -166,6 +178,7 @@ def _merge_single_subset_with_sink_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    FULL_BLOCK: tl.constexpr,
 ):
     token_head = tl.program_id(0)
     block_d = tl.program_id(1)
@@ -183,23 +196,29 @@ def _merge_single_subset_with_sink_kernel(
     subset_weight = tl.exp(subset_lse - merge_max)
     sink_weight = tl.exp(sink - merge_max)
     denom = subset_weight + sink_weight
-    subset_output = tl.load(
-        subset_output_ptr
-        + token_idx * stride_subset_t
+    subset_offsets = (
+        token_idx * stride_subset_t
         + head_idx * stride_subset_h
-        + offsets * stride_subset_d,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    merged = subset_output * subset_weight / denom
-    tl.store(
-        output_ptr
-        + token_idx * stride_output_t
-        + head_idx * stride_output_h
-        + offsets * stride_output_d,
-        merged,
-        mask=mask,
+        + offsets * stride_subset_d
     )
+    output_offsets = (
+        token_idx * stride_output_t
+        + head_idx * stride_output_h
+        + offsets * stride_output_d
+    )
+    if tl.constexpr(FULL_BLOCK):
+        subset_output = tl.load(subset_output_ptr + subset_offsets).to(tl.float32)
+    else:
+        subset_output = tl.load(
+            subset_output_ptr + subset_offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+    merged = subset_output * subset_weight / denom
+    if tl.constexpr(FULL_BLOCK):
+        tl.store(output_ptr + output_offsets, merged)
+    else:
+        tl.store(output_ptr + output_offsets, merged, mask=mask)
 
 
 def merge_sparse_mla_subset_with_sink(
@@ -223,6 +242,7 @@ def merge_sparse_mla_subset_with_sink(
     else:
         block_d = min(128, triton.next_power_of_2(head_dim))
         num_warps = 4
+    full_block = head_dim % block_d == 0
     grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
     _merge_single_subset_with_sink_kernel[grid](
         subset_output,
@@ -240,6 +260,7 @@ def merge_sparse_mla_subset_with_sink(
         num_heads,
         head_dim,
         BLOCK_D=block_d,
+        FULL_BLOCK=full_block,
         num_warps=num_warps,
     )
 
