@@ -5,6 +5,10 @@ set -euo pipefail
 PORT="${PORT:-8081}"
 MODEL="${MODEL:-/home/gerben/ai/models/DeepSeek-V4-Flash}"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+export PYTHONPATH="$SCRIPT_DIR/external/b12x${PYTHONPATH:+:$PYTHONPATH}"
+
+
 export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
