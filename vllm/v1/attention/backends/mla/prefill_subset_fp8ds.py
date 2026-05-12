@@ -13,6 +13,8 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
     k_cache_ptr,
     local_indices_ptr,
     token_to_req_indices_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
     block_table_ptr,
     subset_output_ptr,
     subset_lse_ptr,
@@ -37,6 +39,8 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
     head_dim: tl.constexpr,
     num_candidates,
     scale: tl.constexpr,
+    global_token_offset: tl.constexpr,
+    compress_ratio: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     FULL_TILE: tl.constexpr,
@@ -67,6 +71,14 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
     running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    global_token_idx = token_idx + tl.full((), global_token_offset, tl.int32)
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    prefix_len = seq_len - query_len
+    pos = prefix_len + global_token_idx - query_start
+    topk_len = tl.minimum((pos + 1) // compress_ratio, num_candidates)
     fp8_mask = dim_offsets < fp8_dim
     rope_mask = (dim_offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
@@ -75,7 +87,7 @@ def _finalize_fp8ds_local_slots_subset_multihead_kernel(
         local_idx = tl.load(
             local_indices_ptr + token_idx * stride_local_t + candidate_idx * stride_local_c
         )
-        is_valid = local_idx >= 0
+        is_valid = (local_idx >= 0) & (candidate_idx < topk_len)
 
         if is_valid:
             block_indices = local_idx // cache_block_size
@@ -293,9 +305,13 @@ def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
     k_cache: torch.Tensor,
     local_indices: torch.Tensor,
     token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
     scale: float,
+    global_token_offset: int,
+    compress_ratio: int,
     subset_output: torch.Tensor,
     subset_lse: torch.Tensor,
     head_block_size: int = 16,
@@ -324,6 +340,8 @@ def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
         k_cache,
         local_indices,
         token_to_req_indices,
+        query_start_loc,
+        seq_lens,
         block_table,
         subset_output,
         subset_lse,
@@ -348,6 +366,8 @@ def finalize_fp8ds_local_slots_sparse_mla_attention_subset_multihead(
         head_dim,
         num_candidates,
         scale,
+        global_token_offset,
+        compress_ratio,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
         FULL_TILE=full_tile,
