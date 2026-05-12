@@ -2,3 +2,7 @@
 	path = DeepGEMM
 	url = https://github.com/leavelet/DeepGEMM.git
 	branch = sm120
+[submodule "external/b12x"]
+	path = external/b12x
+	url = git@github.com:infernix/b12x.git
+	branch = ds4-sm120-full-autoresearch-fastprefill
