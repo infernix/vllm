@@ -115,7 +115,12 @@ def merge_two_sparse_mla_subsets_with_sink(
     assert output.is_cuda
 
     num_tokens, num_heads, head_dim = subset0_output.shape
-    block_d = min(128, triton.next_power_of_2(head_dim))
+    if head_dim == 512:
+        block_d = 256
+        num_warps = 8
+    else:
+        block_d = min(128, triton.next_power_of_2(head_dim))
+        num_warps = 4
     grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
     _merge_two_subsets_with_sink_kernel[grid](
         subset0_output,
@@ -140,7 +145,7 @@ def merge_two_sparse_mla_subsets_with_sink(
         num_heads,
         head_dim,
         BLOCK_D=block_d,
-        num_warps=4,
+        num_warps=num_warps,
     )
 
 
@@ -212,7 +217,12 @@ def merge_sparse_mla_subset_with_sink(
     assert output.is_cuda
 
     num_tokens, num_heads, head_dim = subset_output.shape
-    block_d = min(128, triton.next_power_of_2(head_dim))
+    if head_dim == 512:
+        block_d = 256
+        num_warps = 8
+    else:
+        block_d = min(128, triton.next_power_of_2(head_dim))
+        num_warps = 4
     grid = (num_tokens * num_heads, triton.cdiv(head_dim, block_d))
     _merge_single_subset_with_sink_kernel[grid](
         subset_output,
@@ -230,7 +240,7 @@ def merge_sparse_mla_subset_with_sink(
         num_heads,
         head_dim,
         BLOCK_D=block_d,
-        num_warps=4,
+        num_warps=num_warps,
     )
 
 
