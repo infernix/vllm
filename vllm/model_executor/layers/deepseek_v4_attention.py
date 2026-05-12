@@ -370,6 +370,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             prefix=prefix,
             indexer=self.indexer,
             topk_indices_buffer=self.topk_indices_buffer,
+            aux_stream=(
+                self.aux_stream_list[0]
+                if self.aux_stream_list is not None
+                else None
+            ),
         )
         # Register this layer in the compilation config's static forward context
         # This allows the custom op to retrieve the layer during execution
