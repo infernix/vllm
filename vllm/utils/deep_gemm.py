@@ -633,6 +633,8 @@ def _fp8_paged_mqa_topk_b12x(
     topk_indices: torch.Tensor,
     effective_model_len: int,
 ) -> bool:
+    return False
+
     imported = _try_import_b12x_nsa_indexer()
     if imported is None:
         return False
