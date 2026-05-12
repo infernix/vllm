@@ -1473,6 +1473,7 @@ def _accumulate_fp8ds_local_slots_attention_chunk_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    INIT_STATE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
@@ -1497,15 +1498,20 @@ def _accumulate_fp8ds_local_slots_attention_chunk_multihead_kernel(
         + head_offsets[:, None] * stride_acc_h
         + dim_offsets[None, :] * stride_acc_d
     )
-    running_max = tl.load(
-        max_score_ptr + state_offsets,
-        mask=head_mask,
-        other=-float("inf"),
-    )
-    running_denom = tl.load(denom_ptr + state_offsets, mask=head_mask, other=0.0)
-    running_acc = tl.load(acc_ptr + acc_offsets, mask=matrix_mask, other=0.0).to(
-        tl.float32
-    )
+    if tl.constexpr(INIT_STATE):
+        running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
+        running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
+        running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
+    else:
+        running_max = tl.load(
+            max_score_ptr + state_offsets,
+            mask=head_mask,
+            other=-float("inf"),
+        )
+        running_denom = tl.load(denom_ptr + state_offsets, mask=head_mask, other=0.0)
+        running_acc = tl.load(acc_ptr + acc_offsets, mask=matrix_mask, other=0.0).to(
+            tl.float32
+        )
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     fp8_mask = dim_offsets < fp8_dim
@@ -1580,6 +1586,7 @@ def accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
     denom: torch.Tensor,
     acc: torch.Tensor,
     head_block_size: int = 2,
+    init_state: bool = False,
 ) -> None:
     if q.dim() == 4:
         assert q.shape[1] == 1
@@ -1657,6 +1664,7 @@ def accumulate_fp8ds_local_slots_sparse_mla_attention_chunk_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
+        INIT_STATE=init_state,
         num_warps=8,
     )
 
@@ -1694,6 +1702,7 @@ def _accumulate_fp8ds_swa_slots_attention_chunk_multihead_kernel(
     scale: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    INIT_STATE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
@@ -1718,15 +1727,20 @@ def _accumulate_fp8ds_swa_slots_attention_chunk_multihead_kernel(
         + head_offsets[:, None] * stride_acc_h
         + dim_offsets[None, :] * stride_acc_d
     )
-    running_max = tl.load(
-        max_score_ptr + state_offsets,
-        mask=head_mask,
-        other=-float("inf"),
-    )
-    running_denom = tl.load(denom_ptr + state_offsets, mask=head_mask, other=0.0)
-    running_acc = tl.load(acc_ptr + acc_offsets, mask=matrix_mask, other=0.0).to(
-        tl.float32
-    )
+    if tl.constexpr(INIT_STATE):
+        running_max = tl.full((HEAD_BLOCK,), -float("inf"), tl.float32)
+        running_denom = tl.zeros((HEAD_BLOCK,), tl.float32)
+        running_acc = tl.zeros((HEAD_BLOCK, BLOCK_D), tl.float32)
+    else:
+        running_max = tl.load(
+            max_score_ptr + state_offsets,
+            mask=head_mask,
+            other=-float("inf"),
+        )
+        running_denom = tl.load(denom_ptr + state_offsets, mask=head_mask, other=0.0)
+        running_acc = tl.load(acc_ptr + acc_offsets, mask=matrix_mask, other=0.0).to(
+            tl.float32
+        )
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     global_token_idx = token_idx + tl.full((), global_token_offset, tl.int32)
@@ -1811,6 +1825,7 @@ def accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
     denom: torch.Tensor,
     acc: torch.Tensor,
     head_block_size: int = 2,
+    init_state: bool = False,
 ) -> None:
     if q.dim() == 4:
         assert q.shape[1] == 1
@@ -1884,6 +1899,7 @@ def accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
         scale,
         HEAD_BLOCK=head_block_size,
         BLOCK_D=block_d,
+        INIT_STATE=init_state,
         num_warps=8,
     )
 

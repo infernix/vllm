@@ -1321,12 +1321,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_max_score = swa_max_score_buf[:num_tokens]
         swa_denom = swa_denom_buf[:num_tokens]
         swa_acc = swa_acc_buf[:num_tokens]
-        comp_max_score.fill_(float("-inf"))
-        comp_denom.zero_()
-        comp_acc.zero_()
-        swa_max_score.fill_(float("-inf"))
-        swa_denom.zero_()
-        swa_acc.zero_()
 
         topk_chunk_size = min(
             local_topk_indices.shape[-1],
@@ -1351,6 +1345,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     denom=comp_denom,
                     acc=comp_acc,
                     head_block_size=16,
+                    init_state=(chunk_start == 0),
                 )
 
         def swa_path() -> None:
@@ -1369,6 +1364,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 denom=swa_denom,
                 acc=swa_acc,
                 head_block_size=16,
+                init_state=True,
             )
 
         maybe_execute_in_parallel(
@@ -1410,9 +1406,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         max_score = max_score_buf[:num_tokens]
         denom = denom_buf[:num_tokens]
         acc = acc_buf[:num_tokens]
-        max_score.fill_(float("-inf"))
-        denom.zero_()
-        acc.zero_()
         accumulate_fp8ds_swa_slots_sparse_mla_attention_chunk_multihead(
             q=q,
             k_cache=swa_k_cache,
@@ -1428,6 +1421,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             denom=denom,
             acc=acc,
             head_block_size=16,
+            init_state=True,
         )
         finish_sparse_mla_attention_with_sink(
             max_score,
