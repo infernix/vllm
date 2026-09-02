@@ -114,6 +114,13 @@ def test_tensor_segment_limits_noncontiguous_views_to_their_storage():
     assert segment == ("expanded", view.data_ptr(), storage.numel() * 4)
 
 
+def test_invalid_numeric_environment_values_use_defaults(monkeypatch):
+    monkeypatch.setenv("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", "invalid")
+    monkeypatch.setenv("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "invalid")
+    assert l2pf._int_env("VLLM_GLM53_L2_PREFETCH_MAX_TOKENS", 256) == 256
+    assert l2pf._mb("VLLM_GLM53_L2_PREFETCH_BUDGET_A_MB", "20") == 20_000_000
+
+
 def _driver():
     from cuda.bindings import driver as cu
 
