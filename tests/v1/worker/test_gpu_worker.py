@@ -165,7 +165,6 @@ def test_b12x_warmup_precedes_cudagraph_memory_profile(
         "profile_cudagraph_memory",
     ]
     assert available == expected_available_memory
-    assert available == 80
 
 
 def _pool_context_worker(*, enable_cumem_allocator: bool, enable_sleep_mode: bool):
