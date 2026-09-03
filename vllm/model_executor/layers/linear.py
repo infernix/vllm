@@ -767,7 +767,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 loaded_size,
                 physical_size,
             )
-        self._allow_loaded_output_padding = [
+        self._allow_loaded_output_shard_padding = [
             loaded_output_sizes is not None and loaded_size != physical_size
             for loaded_size, physical_size in zip(
                 self.loaded_output_sizes, self.output_sizes
@@ -920,7 +920,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     loaded_weight,
                     output_dim,
                     start_idx,
-                    allow_padding=self._allow_loaded_output_padding[
+                    allow_padding=self._allow_loaded_output_shard_padding[
                         loaded_shard_id
                     ],
                 )
@@ -1054,7 +1054,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
-            allow_padding=self._allow_loaded_output_padding[loaded_shard_id],
+            allow_padding=self._allow_loaded_output_shard_padding[loaded_shard_id],
         )
 
     def load_weights(
