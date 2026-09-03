@@ -809,6 +809,26 @@ def test_b12x_glm5_next_ckv_source_layout() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("page_size", "dcp_world_size", "alignment"),
+    [(2048, 4, 512), (2048, 2, 1024), (512, 4, 128), (512, 3, 512)],
+)
+def test_full_ckv_rank_alignment_only_pads_the_concatenated_cache_to_pages(
+    page_size: int,
+    dcp_world_size: int,
+    alignment: int,
+) -> None:
+    assert _ckv_rank_token_alignment(page_size, dcp_world_size) == alignment
+    padded = _round_up_ckv_rank_tokens(
+        1025,
+        page_size=page_size,
+        dcp_world_size=dcp_world_size,
+    )
+    assert padded >= 1025
+    assert padded % alignment == 0
+    assert padded * dcp_world_size % page_size == 0
+
+
 @pytest.mark.parametrize("record_bytes", [528, 304])
 def test_b12x_glm5_next_full_ckv_workspaces_follow_cache_format(
     record_bytes: int,
