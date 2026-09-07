@@ -201,8 +201,8 @@ def _restore_auxiliary_state_kernel(
     metadata_ptr,
     pool_ptr,
     pool_stride: tl.int64,
-    block,
-    slot,
+    block: tl.int64,
+    slot: tl.int64,
     BLOCK: tl.constexpr,
 ):
     state = tl.program_id(0)
@@ -210,8 +210,8 @@ def _restore_auxiliary_state_kernel(
     stride = tl.load(metadata_ptr + state * 4 + 1)
     size = tl.load(metadata_ptr + state * 4 + 2)
     offset = tl.load(metadata_ptr + state * 4 + 3)
-    source = pool_ptr + block.to(tl.int64) * pool_stride + offset
-    destination = (base + slot.to(tl.int64) * stride).to(tl.pointer_type(tl.uint8))
+    source = pool_ptr + block * pool_stride + offset
+    destination = (base + slot * stride).to(tl.pointer_type(tl.uint8))
     x = tl.arange(0, BLOCK)
     for start in range(0, size, BLOCK):
         data = tl.load(source + start + x, start + x < size, other=0)
