@@ -52,6 +52,12 @@ class _Glm53TP3SharedHead(nn.Module):
             quant_config=quant_config,
             padding_size=config.glm53_tp3_vocab_padding_size,
             prefix=maybe_prefix(prefix, "head"),
+            # R27 #665: the default NVFP4 proposal head must survive the TP3
+            # dispatch too; without this the TP3 path would keep the BF16 head
+            # and silently lose the head-only quantization speedup.
+            lm_head_quantization=(
+                "nvfp4" if envs.VLLM_MTP_NVFP4_LM_HEAD else None
+            ),
         )
 
 
